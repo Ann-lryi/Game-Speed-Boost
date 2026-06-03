@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Glowing Cyber Core Hexagon Platform -->
+    <path
+        android:strokeWidth="1.5"
+        android:strokeColor="#00E676"
+        android:fillColor="#151A26"
+        android:pathData="M 54,20 L 84,37.3 L 84,72 L 54,89.3 L 24,72 L 24,37.3 Z" />
+
+    <!-- inner shield boundaries -->
+    <path
+        android:strokeWidth="0.8"
+        android:strokeColor="#10B981"
+        android:fillColor="#00000000"
+        android:pathData="M 54,25 L 79,39.4 L 79,69 L 54,83.4 L 29,69 L 29,39.4 Z" />
+
+    <!-- Central High-Velocity Cyber Bolt/Lightning of Ultimate CPU Overdrive Power -->
+    <path
+        android:pathData="M 56,28 L 36,54 L 52,54 L 46,80 L 72,48 L 54,48 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="36"
+                android:startY="28"
+                android:endX="72"
+                android:endY="80"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#00D5FF" />
+                <item android:offset="1.0" android:color="#00E676" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Wing-shaped outer hardware stabilizers -->
+    <path
+        android:strokeWidth="2.0"
+        android:strokeColor="#00D5FF"
+        android:strokeLineCap="round"
+        android:pathData="M 16,42 L 22,46 M 14,54 L 20,54 M 16,66 L 22,62" />
+    <path
+        android:strokeWidth="2.0"
+        android:strokeColor="#00D5FF"
+        android:strokeLineCap="round"
+        android:pathData="M 92,42 L 86,46 M 94,54 L 88,54 M 92,66 L 86,62" />
+
+    <!-- Tiny cyber nodes circles -->
+    <path
+        android:fillColor="#00E676"
+        android:pathData="M 54,16 A 1.5 1.5 0 1 1 53.9 16" />
+    <path
+        android:fillColor="#00D5FF"
+        android:pathData="M 87,35 A 1.5 1.5 0 1 1 86.9 35" />
+    <path
+        android:fillColor="#00D5FF"
+        android:pathData="M 21,35 A 1.5 1.5 0 1 1 20.9 35" />
+</vector>

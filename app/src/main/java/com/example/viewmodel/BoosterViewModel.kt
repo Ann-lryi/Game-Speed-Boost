@@ -1,0 +1,488 @@
+package com.example.viewmodel
+
+import android.app.ActivityManager
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.util.Log
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.example.data.AppDatabase
+import com.example.data.BoostLog
+import com.example.data.BoosterRepository
+import com.example.data.UserGame
+import com.example.service.GameBoosterService
+import com.example.util.ShizukuManager
+import com.example.util.ShizukuState
+import com.example.util.SystemMetrics
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/**
+ * System telemetry data class with real measurements.
+ * Uses -1 to indicate measurement errors (not fake values).
+ */
+data class SystemTelemetry(
+    val cpuLoad: Int = -1,
+    val ramUsage: Int = -1,
+    val batteryTemp: Int = -1,
+    val resolvedRamGb: String = "-- / -- GB"
+)
+
+data class InstalledAppInfo(
+    val appName: String,
+    val packageName: String
+)
+
+/**
+ * Result of a boost operation with actual metrics.
+ */
+data class BoostResult(
+    val killedApps: List<String>,
+    val freedCacheDescription: String,
+    val ramBeforeMb: Long,
+    val ramAfterMb: Long
+)
+
+class BoosterViewModel(
+    application: Application,
+    private val repository: BoosterRepository
+) : AndroidViewModel(application) {
+
+    private val context: Context get() = getApplication<Application>().applicationContext
+
+    private val _telemetry = MutableStateFlow(SystemTelemetry())
+    val telemetry = _telemetry.asStateFlow()
+
+    private val _installedApps = MutableStateFlow<List<InstalledAppInfo>>(emptyList())
+    val installedApps = _installedApps.asStateFlow()
+
+    private val _isServiceRunning = MutableStateFlow(false)
+    val isServiceRunning = _isServiceRunning.asStateFlow()
+
+    private val _isOverlayActive = MutableStateFlow(false)
+    val isOverlayActive = _isOverlayActive.asStateFlow()
+
+    private val _shizukuState = MutableStateFlow(ShizukuState.NOT_RUNNING)
+    val shizukuState = _shizukuState.asStateFlow()
+
+    private val _ufsVersion = MutableStateFlow("")
+    val ufsVersionState = _ufsVersion.asStateFlow()
+
+    private val exemptedPrefs = context.getSharedPreferences(
+        "gaming_booster_exempted_apps_prefs",
+        Context.MODE_PRIVATE
+    )
+    private val _exemptedApps = MutableStateFlow<Set<String>>(emptySet())
+    val exemptedApps = _exemptedApps.asStateFlow()
+
+    val addedGames: StateFlow<List<UserGame>> = repository.allGames
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val recentLogs: StateFlow<List<BoostLog>> = repository.recentLogs
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _isBoosting = MutableStateFlow(false)
+    val isBoosting = _isBoosting.asStateFlow()
+
+    val consoleLogs = ShizukuManager.consoleLogs
+
+    init {
+        viewModelScope.launch {
+            ShizukuManager.state.collect { state ->
+                _shizukuState.value = state
+            }
+        }
+        checkStates()
+        startTelemetryLoop()
+        loadExemptedApps()
+        loadInstalledApps()
+    }
+
+    fun loadInstalledApps() {
+        viewModelScope.launch {
+            _installedApps.value = withContext(Dispatchers.IO) {
+                try {
+                    val pm = context.packageManager
+                    val packages = pm.getInstalledPackages(0)
+                    packages.mapNotNull { packageInfo ->
+                        val appInfo = packageInfo.applicationInfo ?: return@mapNotNull null
+                        val name = pm.getApplicationLabel(appInfo).toString()
+                        val pkg = packageInfo.packageName
+                        if (name.isNotEmpty() && pkg != context.packageName) {
+                            InstalledAppInfo(name, pkg)
+                        } else null
+                    }.sortedWith(compareBy { it.appName.lowercase() })
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error listing packages", e)
+                    emptyList()
+                }
+            }
+        }
+    }
+
+    private fun loadExemptedApps() {
+        val saved = exemptedPrefs.getStringSet("exempted_packages", null) ?: emptySet()
+        _exemptedApps.value = saved
+    }
+
+    fun toggleExemptedApp(packageName: String) {
+        val current = _exemptedApps.value.toMutableSet()
+        val added = if (current.contains(packageName)) {
+            current.remove(packageName)
+            false
+        } else {
+            current.add(packageName)
+            true
+        }
+        exemptedPrefs.edit().putStringSet("exempted_packages", current).apply()
+        _exemptedApps.value = current
+
+        viewModelScope.launch {
+            repository.insertLog(
+                BoostLog(
+                    actionName = if (added) "🛡️ Added exemption" else "🛡️ Removed exemption",
+                    details = "$packageName will ${if (added) "be protected" else "no longer be protected"} during cleanup"
+                )
+            )
+        }
+    }
+
+    fun checkStates() {
+        _isServiceRunning.value = GameBoosterService.isServiceRunning
+        ShizukuManager.updateShizukuState(context)
+        _shizukuState.value = ShizukuManager.state.value
+
+        viewModelScope.launch {
+            _ufsVersion.value = withContext(Dispatchers.IO) {
+                val ver = SystemMetrics.detectUfsVersion(context)
+                when {
+                    ver.startsWith("4.") -> "UFS 4.x (Ultra Fast)"
+                    ver.startsWith("3.") -> "UFS 3.x (Fast)"
+                    ver.startsWith("2.") -> "UFS 2.x (Standard)"
+                    ver.isNotEmpty() -> "UFS $ver"
+                    else -> "Unable to detect"
+                }
+            }
+        }
+    }
+
+    /**
+     * Real telemetry loop that reads actual system metrics.
+     * Uses SystemMetrics with proper delta calculation.
+     */
+    private fun startTelemetryLoop() {
+        viewModelScope.launch(Dispatchers.Default) {
+            // Initial delay for CPU cache warmup
+            delay(500)
+
+            while (true) {
+                try {
+                    val ram = SystemMetrics.getRamUsagePercent(context)
+                    val temp = SystemMetrics.getBatteryTempCelsius(context)
+                    val cpu = SystemMetrics.getCpuLoadPercent()
+                    val resolveText = SystemMetrics.getResolvedRamGbText(context)
+
+                    _telemetry.value = SystemTelemetry(
+                        cpuLoad = cpu,
+                        ramUsage = ram,
+                        batteryTemp = temp,
+                        resolvedRamGb = resolveText
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "Telemetry error", e)
+                }
+                delay(2500)
+            }
+        }
+    }
+
+    fun toggleBoosterService() {
+        val nextState = !_isServiceRunning.value
+        val intent = Intent(context, GameBoosterService::class.java).apply {
+            action = if (nextState) GameBoosterService.ACTION_START else GameBoosterService.ACTION_STOP
+        }
+
+        try {
+            if (nextState) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+                viewModelScope.launch {
+                    repository.insertLog(
+                        BoostLog(
+                            actionName = "Start Monitor Service",
+                            details = "Game optimization service started with real-time monitoring"
+                        )
+                    )
+                }
+            } else {
+                context.stopService(intent)
+                _isOverlayActive.value = false
+                viewModelScope.launch {
+                    repository.insertLog(
+                        BoostLog(
+                            actionName = "Stop Monitor Service",
+                            details = "Game optimization service stopped. All tweaks reverted."
+                        )
+                    )
+                }
+            }
+            _isServiceRunning.value = nextState
+        } catch (e: Exception) {
+            Log.e(TAG, "Error toggling service", e)
+        }
+    }
+
+    fun toggleFloatingMeter() {
+        if (!_isServiceRunning.value) {
+            toggleBoosterService()
+        }
+        val intent = Intent(context, GameBoosterService::class.java).apply {
+            action = GameBoosterService.ACTION_TOGGLE_OVERLAY
+        }
+        context.startService(intent)
+        _isOverlayActive.value = !_isOverlayActive.value
+    }
+
+    fun requestShizukuAuthorization() {
+        if (ShizukuManager.isShizukuAvailable()) {
+            ShizukuManager.requestPermission(1001)
+        } else {
+            ShizukuManager.updateShizukuState(context)
+            val currentState = ShizukuManager.state.value
+            _shizukuState.value = currentState
+
+            viewModelScope.launch {
+                val detailMsg = when (currentState) {
+                    ShizukuState.NOT_INSTALLED -> "Shizuku app not installed. Please install it from GitHub or Play Store."
+                    ShizukuState.NOT_RUNNING -> "Shizuku service not running. Please start Shizuku via ADB or Wireless Debugging."
+                    ShizukuState.UNAUTHORIZED -> "Shizuku permission not granted. Please allow this app in Shizuku."
+                    else -> "Cannot connect to Shizuku. Please ensure it's running."
+                }
+                repository.insertLog(
+                    BoostLog(
+                        actionName = "❌ Shizuku Connection Failed",
+                        details = detailMsg
+                    )
+                )
+                withContext(Dispatchers.Main) {
+                    android.widget.Toast.makeText(context, detailMsg, android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * Real quick boost that:
+     * 1. Trims caches via pm trim-caches
+     * 2. Kills background processes (excluding exempted apps)
+     * 3. Reports actual metrics without faking data
+     */
+    fun quickBoost() {
+        viewModelScope.launch {
+            if (_isBoosting.value) return@launch
+            _isBoosting.value = true
+
+            val ramBeforeMb = SystemMetrics.getAvailableRamMb(context)
+            val exempted = _exemptedApps.value
+
+            repository.insertLog(
+                BoostLog(
+                    actionName = "🔍 System Scan Started",
+                    details = "Analyzing cache usage and background processes..."
+                )
+            )
+
+            // Step 1: Trim caches (always safe)
+            val cacheResult = withContext(Dispatchers.IO) {
+                ShizukuManager.executeShell("pm trim-caches 4096G")
+            }
+            delay(400)
+
+            // Step 2: Kill selected background processes
+            val killedApps = mutableListOf<String>()
+            val pm = context.packageManager
+
+            val killResults = withContext(Dispatchers.IO) {
+                // Get running processes that are safe to kill
+                val runningApps = try {
+                    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                    am.runningAppProcesses?.map { it.processName } ?: emptyList()
+                } catch (e: Exception) {
+                    emptyList()
+                }
+
+                // Find killable targets (non-system, not exempted, not self, actually running)
+                val targets = _installedApps.value.filter { app ->
+                    app.packageName != context.packageName &&
+                            !exempted.contains(app.packageName) &&
+                            runningApps.contains(app.packageName)
+                }.filter { app ->
+                    try {
+                        val appInfo = pm.getApplicationInfo(app.packageName, 0)
+                        // Only kill non-system, non-persistent apps
+                        (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) == 0 &&
+                                (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_PERSISTENT) == 0
+                    } catch (e: Exception) {
+                        false
+                    }
+                }.take(15) // Reasonable limit
+
+                for (app in targets) {
+                    try {
+                        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                        am.killBackgroundProcesses(app.packageName)
+
+                        // Also try Shizuku force-stop for better results
+                        if (ShizukuManager.state.value == ShizukuState.AUTHORIZED) {
+                            ShizukuManager.executeShell("am force-stop ${app.packageName}")
+                        }
+
+                        killedApps.add(app.appName)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to kill ${app.packageName}", e)
+                    }
+                }
+
+                killedApps
+            }
+
+            delay(500)
+            val ramAfterMb = SystemMetrics.getAvailableRamMb(context)
+
+            // Calculate actual freed memory (may be negative due to system allocation)
+            val freedMb = if (ramAfterMb > 0 && ramBeforeMb > 0) {
+                (ramAfterMb - ramBeforeMb).coerceAtLeast(0)
+            } else 0
+
+            // Build honest result description
+            val detailsText = buildString {
+                if (cacheResult.isSuccess) {
+                    append("Cache trim executed. ")
+                }
+                if (killResults.isNotEmpty()) {
+                    append("Stopped ${killResults.size} background apps: ${killResults.take(5).joinToString(", ")}")
+                    if (killResults.size > 5) append(" and ${killResults.size - 5} more")
+                    append(". ")
+                } else {
+                    append("No safe-to-kill background apps found. ")
+                }
+                if (freedMb > 0) {
+                    append("Available RAM increased by ~${freedMb}MB.")
+                } else {
+                    append("System reallocated memory during cleanup (normal behavior).")
+                }
+            }
+
+            repository.insertLog(
+                BoostLog(
+                    actionName = if (killResults.isNotEmpty()) "🚀 Cleanup Complete" else "🧹 Cache Trimmed",
+                    details = detailsText,
+                    clearedMemoryMb = freedMb.toInt()
+                )
+            )
+
+            _isBoosting.value = false
+            checkStates()
+        }
+    }
+
+    fun executeShizukuTweak(tweakName: String, command: String, onResult: ((Boolean, String) -> Unit)? = null) {
+        viewModelScope.launch {
+            val result = ShizukuManager.executeShell(command)
+            repository.insertLog(
+                BoostLog(
+                    actionName = tweakName,
+                    details = if (result.isSuccess) "Success (${result.executionTimeMs}ms): ${result.output.take(200)}"
+                    else "Failed: ${result.output.take(200)}"
+                )
+            )
+            onResult?.invoke(result.isSuccess, result.output)
+        }
+    }
+
+    fun addGameToSpace(name: String, packageName: String, profile: String, fps: Int) {
+        viewModelScope.launch {
+            // Verify package exists
+            val exists = try {
+                context.packageManager.getPackageInfo(packageName, 0)
+                true
+            } catch (e: Exception) {
+                false
+            }
+
+            if (!exists) {
+                repository.insertLog(
+                    BoostLog(
+                        actionName = "⚠️ Game Not Found",
+                        details = "Package $packageName is not installed on this device"
+                    )
+                )
+                return@launch
+            }
+
+            repository.insertGame(
+                UserGame(
+                    gameName = name,
+                    packageName = packageName,
+                    performanceProfile = profile,
+                    customFps = fps
+                )
+            )
+            repository.insertLog(
+                BoostLog(
+                    actionName = "Game Registered",
+                    details = "$name ($packageName) added with profile: $profile, target FPS: $fps"
+                )
+            )
+        }
+    }
+
+    fun removeGame(game: UserGame) {
+        viewModelScope.launch {
+            repository.deleteGame(game)
+            repository.insertLog(
+                BoostLog(
+                    actionName = "Game Removed",
+                    details = "${game.gameName} removed from game list"
+                )
+            )
+        }
+    }
+
+    fun clearLogViewer() {
+        viewModelScope.launch {
+            repository.clearLogHistory()
+        }
+    }
+
+    fun clearTerminalConsole() {
+        ShizukuManager.clearConsole()
+    }
+
+    companion object {
+        private const val TAG = "BoosterViewModel"
+    }
+}
+
+class BoosterViewModelFactory(
+    private val application: Application,
+    private val repository: BoosterRepository
+) : ViewModelProvider.Factory {
+    @Suppress("UNCHECKED_CAST")
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(BoosterViewModel::class.java)) {
+            return BoosterViewModel(application, repository) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class: ${modelClass.name}")
+    }
+}

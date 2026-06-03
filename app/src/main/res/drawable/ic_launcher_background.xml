@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Sophisticated Cyber Black-Slate Dark Premium background -->
+    <path
+        android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="0"
+                android:startY="0"
+                android:endX="108"
+                android:endY="108"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#0B0D13" />
+                <item android:offset="0.5" android:color="#131722" />
+                <item android:offset="1.0" android:color="#07090D" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Tech Matrix Blue Grid Overlay -->
+    <path
+        android:strokeWidth="0.4"
+        android:strokeColor="#1E2A38"
+        android:pathData="M9,0 L9,108 M18,0 L18,108 M27,0 L27,108 M36,0 L36,108 M45,0 L45,108 M54,0 L54,108 M63,0 L63,108 M72,0 L72,108 M81,0 L81,108 M90,0 L90,108 M99,0 L99,108" />
+    <path
+        android:strokeWidth="0.4"
+        android:strokeColor="#1E2A38"
+        android:pathData="M0,9 L108,9 M0,18 L108,18 M0,27 L108,27 M0,36 L108,36 M0,45 L108,45 M0,54 L108,54 M0,63 L108,63 M0,72 L108,72 M0,81 L108,81 M0,90 L108,90 M0,99 L108,99" />
+
+    <!-- Corner Sci-Fi Bracket Overlays for high visual aesthetic -->
+    <path
+        android:strokeWidth="1.2"
+        android:strokeColor="#2C3D52"
+        android:strokeLineCap="round"
+        android:pathData="M 12 24 L 12 12 L 24 12 M 96 24 L 96 12 L 84 12 M 12 84 L 12 96 L 24 96 M 96 84 L 96 96 L 84 96" />
+
+    <!-- Dynamic Tech Concentric Rings -->
+    <path
+        android:strokeWidth="0.8"
+        android:strokeColor="#2563EB"
+        android:pathData="M 54 24 A 30 30 0 1 1 53.9 24" />
+    <path
+        android:strokeWidth="0.4"
+        android:strokeColor="#00E676"
+        android:pathData="M 54 34 A 20 20 0 1 1 53.9 34" />
+</vector>

@@ -1,0 +1,6 @@
+{
+  "name": "Game Speed Boost",
+  "description": "An advanced gaming booster with Shizuku integration for CPU management, Custom FPS hacks, thermal throttling controls, and a persistent overlay meter.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
