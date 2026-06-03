@@ -2,6 +2,7 @@ package com.example.util
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -9,7 +10,7 @@ import rikka.shizuku.Shizuku
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
 
 enum class ShizukuState {
     NOT_INSTALLED,
@@ -40,8 +41,11 @@ object ShizukuManager {
     private val _consoleLogs = MutableStateFlow<List<ConsoleCommand>>(emptyList())
     val consoleLogs = _consoleLogs.asStateFlow()
 
-    // Thread-safe log counter
-    private val logCounter = AtomicInteger(0)
+    // FIX L-04: Proper lock object — AtomicInteger was misleading (never incremented)
+    private val logLock = Any()
+
+    // FIX H-01: Per-package frame count cache for delta FPS calculation
+    private val frameCountCache = mutableMapOf<String, Pair<Long, Long>>() // pkg -> (count, timeMs)
 
     init {
         try {
@@ -80,7 +84,6 @@ object ShizukuManager {
     }
 
     fun updateShizukuState(context: Context) {
-        // First check if binder is alive
         try {
             if (Shizuku.pingBinder()) {
                 _state.value = if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
@@ -94,21 +97,11 @@ object ShizukuManager {
             Log.d(TAG, "pingBinder failed", e)
         }
 
-        // Binder not alive - check if Shizuku app is installed
         val isInstalled = isPackageInstalled(context, SHIZUKU_PACKAGE_NAME)
-        _state.value = if (!isInstalled) {
-            ShizukuState.NOT_INSTALLED
-        } else {
-            ShizukuState.NOT_RUNNING
-        }
+        _state.value = if (!isInstalled) ShizukuState.NOT_INSTALLED else ShizukuState.NOT_RUNNING
     }
 
-    /**
-     * Check if a package is installed using multiple methods.
-     * Returns FALSE if all methods fail - no defaulting to true.
-     */
     fun isPackageInstalled(context: Context, packageName: String): Boolean {
-        // Method 1: Standard getPackageInfo
         try {
             if (android.os.Build.VERSION.SDK_INT >= 33) {
                 context.packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
@@ -120,53 +113,24 @@ object ShizukuManager {
         } catch (e: Exception) {
             Log.d(TAG, "getPackageInfo failed for $packageName: ${e.message}")
         }
-
-        // Method 2: Query installed applications
         try {
             @Suppress("DEPRECATION")
             val apps = context.packageManager.getInstalledApplications(0)
-            for (app in apps) {
-                if (app.packageName == packageName) {
-                    return true
-                }
-            }
+            for (app in apps) { if (app.packageName == packageName) return true }
         } catch (e: Exception) {
             Log.d(TAG, "getInstalledApplications failed: ${e.message}")
         }
-
-        // Method 3: Query launcher intent
         try {
-            val intent = context.packageManager.getLaunchIntentForPackage(packageName)
-            if (intent != null) {
-                return true
-            }
+            if (context.packageManager.getLaunchIntentForPackage(packageName) != null) return true
         } catch (e: Exception) {
             Log.d(TAG, "getLaunchIntentForPackage failed: ${e.message}")
         }
-
-        // Method 4: Try Shizuku permission intent
-        try {
-            val intent = android.content.Intent("rikka.shizuku.intent.action.REQUEST_PERMISSION")
-            @Suppress("DEPRECATION")
-            val list = context.packageManager.queryIntentActivities(intent, 0)
-            if (list.isNotEmpty()) {
-                return true
-            }
-        } catch (e: Exception) {
-            Log.d(TAG, "queryIntentActivities failed: ${e.message}")
-        }
-
-        // All methods failed - package is NOT installed
         Log.i(TAG, "Package $packageName not found by any detection method")
         return false
     }
 
     fun isShizukuAvailable(): Boolean {
-        return try {
-            Shizuku.pingBinder()
-        } catch (e: Throwable) {
-            false
-        }
+        return try { Shizuku.pingBinder() } catch (e: Throwable) { false }
     }
 
     fun requestPermission(requestCode: Int) {
@@ -182,8 +146,8 @@ object ShizukuManager {
     }
 
     /**
-     * Execute shell command with timeout protection.
-     * Returns ConsoleCommand with actual result, no fake data.
+     * Execute shell command. Must be called from a background thread (Dispatchers.IO).
+     * Returns ConsoleCommand with actual result.
      */
     fun executeShell(command: String): ConsoleCommand {
         val startTime = System.currentTimeMillis()
@@ -195,13 +159,11 @@ object ShizukuManager {
         try {
             when (_state.value) {
                 ShizukuState.AUTHORIZED -> {
-                    // Execute via Shizuku with proper process API
                     val result = executeViaShizuku(command)
                     success = result.first
                     resultOutput = result.second
                 }
                 else -> {
-                    // No Shizuku access - cannot execute shell commands
                     resultOutput = "[ERROR] Shizuku not authorized. State: ${_state.value.name}"
                     success = false
                 }
@@ -213,7 +175,6 @@ object ShizukuManager {
         }
 
         val executionTime = System.currentTimeMillis() - startTime
-
         val cmdObject = ConsoleCommand(
             command = command,
             output = resultOutput,
@@ -221,8 +182,8 @@ object ShizukuManager {
             executionTimeMs = executionTime
         )
 
-        // Thread-safe log addition using copy-on-write pattern
-        synchronized(logCounter) {
+        // FIX L-04: Use proper lock object (not AtomicInteger)
+        synchronized(logLock) {
             val currentList = _consoleLogs.value.toMutableList()
             currentList.add(0, cmdObject)
             while (currentList.size > MAX_CONSOLE_LOGS) {
@@ -234,41 +195,57 @@ object ShizukuManager {
         return cmdObject
     }
 
+    /**
+     * FIX C-04: Read stdout and stderr CONCURRENTLY on separate threads to prevent
+     * deadlock when either buffer fills while the other is being drained.
+     */
     private fun executeViaShizuku(command: String): Pair<Boolean, String> {
         return try {
             val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
             val outputBuilder = StringBuilder()
+            val errorBuilder  = StringBuilder()
 
-            // Read stdout
-            BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
-                var line: String?
-                while (reader.readLine().also { line = it } != null) {
-                    outputBuilder.append(line).append("\n")
-                }
+            // Drain stdout and stderr in parallel — classic deadlock fix
+            val stdoutThread = thread(start = true, isDaemon = true) {
+                try {
+                    BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
+                        var line: String?
+                        while (reader.readLine().also { line = it } != null) {
+                            outputBuilder.append(line).append("\n")
+                        }
+                    }
+                } catch (_: Exception) { /* stream closed */ }
             }
 
-            // Read stderr
-            BufferedReader(InputStreamReader(process.errorStream)).use { reader ->
-                var line: String?
-                while (reader.readLine().also { line = it } != null) {
-                    outputBuilder.append("[ERR] ").append(line).append("\n")
-                }
+            val stderrThread = thread(start = true, isDaemon = true) {
+                try {
+                    BufferedReader(InputStreamReader(process.errorStream)).use { reader ->
+                        var line: String?
+                        while (reader.readLine().also { line = it } != null) {
+                            errorBuilder.append("[ERR] ").append(line).append("\n")
+                        }
+                    }
+                } catch (_: Exception) { /* stream closed */ }
             }
 
             val finished = process.waitFor(SHELL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             if (!finished) {
                 process.destroyForcibly()
+                stdoutThread.interrupt()
+                stderrThread.interrupt()
                 return Pair(false, "[ERROR] Command timed out after ${SHELL_TIMEOUT_SECONDS}s")
             }
 
-            val exitCode = process.exitValue()
-            val output = outputBuilder.toString().trim()
+            // Wait for reader threads to flush remaining buffered data
+            stdoutThread.join(1000)
+            stderrThread.join(1000)
 
-            if (output.isEmpty()) {
-                Pair(exitCode == 0, "Exit code: $exitCode")
-            } else {
-                Pair(exitCode == 0, output)
-            }
+            val exitCode = process.exitValue()
+            val combined = (outputBuilder.toString() + errorBuilder.toString()).trim()
+
+            if (combined.isEmpty()) Pair(exitCode == 0, "Exit code: $exitCode")
+            else Pair(exitCode == 0, combined)
+
         } catch (e: Exception) {
             Log.e(TAG, "Shizuku execution failed", e)
             Pair(false, "[ERROR] ${e.localizedMessage ?: "Shizuku execution failed"}")
@@ -276,44 +253,70 @@ object ShizukuManager {
     }
 
     fun clearConsole() {
-        synchronized(logCounter) {
+        synchronized(logLock) {
             _consoleLogs.value = emptyList()
         }
     }
 
-    /**
-     * Check if a specific app process is currently running.
-     * Returns the actual PID if found, -1 otherwise.
-     */
     fun getAppPid(packageName: String): Int {
         if (_state.value != ShizukuState.AUTHORIZED) return -1
-
         val result = executeShell("pidof $packageName")
         if (result.isSuccess && result.output.isNotBlank()) {
             val pid = result.output.trim().split(" ").firstOrNull()?.toIntOrNull()
             if (pid != null && pid > 0) return pid
         }
-
-        // Fallback: try pgrep
         val result2 = executeShell("pgrep -f \"$packageName\"")
         if (result2.isSuccess && result2.output.isNotBlank()) {
             val pid = result2.output.trim().split("\n").firstOrNull()?.toIntOrNull()
             if (pid != null && pid > 0) return pid
         }
-
         return -1
     }
 
-    /**
-     * Check if app is running using ActivityManager (no root required)
-     */
     fun isAppRunning(context: Context, packageName: String): Boolean {
         return try {
-            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-            val runningApps = activityManager.runningAppProcesses
-            runningApps?.any { it.processName == packageName } == true
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            am.runningAppProcesses?.any { it.processName == packageName } == true
+        } catch (e: Exception) { false }
+    }
+
+    /**
+     * FIX H-01: Measure GAME's FPS cross-process via dumpsys gfxinfo.
+     * Choreographer-based FPS only works in the current process — this is the correct approach.
+     * Returns delta FPS between calls, or -1 if unavailable/too soon.
+     * Call from Dispatchers.IO only.
+     */
+    fun getGameFpsViaGfxInfo(packageName: String): Int {
+        if (_state.value != ShizukuState.AUTHORIZED) return -1
+        return try {
+            val now = SystemClock.elapsedRealtime()
+            val previous = frameCountCache[packageName]
+
+            // Don't poll more often than once per second
+            if (previous != null && (now - previous.second) < 1000L) return -1
+
+            val result = executeShell("dumpsys gfxinfo $packageName")
+            if (!result.isSuccess || result.output.isBlank()) return -1
+
+            val line = result.output.lineSequence()
+                .firstOrNull { it.contains("Total frames rendered:") }
+            val currentCount = line
+                ?.substringAfter("Total frames rendered:")
+                ?.trim()
+                ?.toLongOrNull() ?: return -1
+
+            val fps = if (previous != null && previous.second > 0) {
+                val delta   = currentCount - previous.first
+                val elapsed = now - previous.second
+                if (delta >= 0 && elapsed > 0) (delta * 1000L / elapsed).toInt().coerceIn(0, 300)
+                else -1
+            } else -1
+
+            frameCountCache[packageName] = Pair(currentCount, now)
+            fps
         } catch (e: Exception) {
-            false
+            Log.e(TAG, "Failed to get game FPS via gfxinfo", e)
+            -1
         }
     }
 }

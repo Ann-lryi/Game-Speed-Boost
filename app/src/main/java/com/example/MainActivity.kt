@@ -29,9 +29,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -58,6 +55,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.AppDatabase
 import com.example.data.BoostLog
@@ -65,11 +65,13 @@ import com.example.data.BoosterRepository
 import com.example.data.UserGame
 import com.example.ui.theme.*
 import com.example.util.ConsoleCommand
+import com.example.util.ShizukuManager
 import com.example.util.ShizukuState
 import com.example.viewmodel.BoosterViewModel
 import com.example.viewmodel.BoosterViewModelFactory
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
 import android.app.ActivityManager
 
@@ -153,6 +155,13 @@ fun MainAppScreen(viewModel: BoosterViewModel) {
     
     val scope = rememberCoroutineScope()
 
+    // FIX H-04: Collect addGameError events and show Toast
+    LaunchedEffect(Unit) {
+        viewModel.addGameError.collect { error ->
+            Toast.makeText(context, error, Toast.LENGTH_LONG).show()
+        }
+    }
+
     // Trigger state check
     LaunchedEffect(Unit) {
         viewModel.checkStates()
@@ -222,7 +231,7 @@ fun MainAppScreen(viewModel: BoosterViewModel) {
                         AnimatedContent(
                             targetState = selectedTab,
                             transitionSpec = {
-                                fadeIn(animationSpec = tween(220)) with fadeOut(animationSpec = tween(180))
+                                fadeIn(animationSpec = tween(220)) togetherWith fadeOut(animationSpec = tween(180))
                             }
                         ) { targetTab ->
                             when (targetTab) {
@@ -254,30 +263,33 @@ fun MainAppScreen(viewModel: BoosterViewModel) {
                                             delay(100)
                                             simulProgress = 0.15f
 
-                                            // Execute and show actual results
+                                            // FIX H-05: Execute tweaks sequentially — await each before advancing progress
                                             simulatedBoostLogs.add("🔋 [SYSTEM] Setting performance mode...")
-                                            viewModel.executeShizukuTweak("Performance Mode", "cmd power set-mode 1") { success, logs ->
-                                                simulatedBoostLogs.add(if (success) "  └> ✅ Applied" else "  └> ⚠️ $logs")
+                                            val r1 = withContext(Dispatchers.IO) {
+                                                ShizukuManager.executeShell("cmd power set-mode 1")
                                             }
-                                            delay(150)
+                                            simulatedBoostLogs.add(if (r1.isSuccess) "  └> ✅ Applied" else "  └> ⚠️ ${r1.output.take(80)}")
                                             simulProgress = 0.35f
+                                            delay(80)
 
                                             simulatedBoostLogs.add("📺 [GFX] Setting refresh rate to ${game.customFps}Hz...")
-                                            viewModel.executeShizukuTweak("Refresh Rate", "settings put global peak_refresh_rate ${game.customFps}.0") { success, logs ->
-                                                simulatedBoostLogs.add(if (success) "  └> ✅ Set to ${game.customFps}Hz" else "  └> ⚠️ $logs")
+                                            val r2 = withContext(Dispatchers.IO) {
+                                                ShizukuManager.executeShell("settings put global peak_refresh_rate ${game.customFps}.0")
                                             }
-                                            delay(150)
+                                            simulatedBoostLogs.add(if (r2.isSuccess) "  └> ✅ Set to ${game.customFps}Hz" else "  └> ⚠️ ${r2.output.take(80)}")
                                             simulProgress = 0.55f
+                                            delay(80)
 
                                             simulatedBoostLogs.add("🧹 [MEMORY] Optimizing memory parameters...")
-                                            viewModel.executeShizukuTweak("Memory Tuning", "sysctl -w vm.extra_free_kbytes=131072") { success, logs ->
-                                                simulatedBoostLogs.add(if (success) "  └> ✅ Tuned" else "  └> ⚠️ Requires root for sysctl")
+                                            val r3 = withContext(Dispatchers.IO) {
+                                                ShizukuManager.executeShell("sysctl -w vm.extra_free_kbytes=131072")
                                             }
-                                            delay(150)
+                                            simulatedBoostLogs.add(if (r3.isSuccess) "  └> ✅ Tuned" else "  └> ⚠️ Requires root for sysctl")
                                             simulProgress = 0.75f
+                                            delay(80)
 
                                             if (game.bypassThermal) {
-                                                simulatedBoostLogs.add("🔥 [THERMAL] Thermal bypass enabled for $game.gameName")
+                                                simulatedBoostLogs.add("🔥 [THERMAL] Thermal bypass enabled for ${game.gameName}")
                                             }
 
                                             simulatedBoostLogs.add("🚀 [LAUNCHER] Launching ${game.gameName}...")
@@ -347,8 +359,8 @@ fun MainAppScreen(viewModel: BoosterViewModel) {
                 AddGameCustomDialog(
                     installedApps = installedApps,
                     onClose = { showAddGameDialog = false },
-                    onGameSaved = { gameName, packageId, profile, targetFps ->
-                        viewModel.addGameToSpace(gameName, packageId, profile, targetFps)
+                    onGameSaved = { gameName, packageId, profile, targetFps, bypassThermal ->
+                        viewModel.addGameToSpace(gameName, packageId, profile, targetFps, bypassThermal)
                         showAddGameDialog = false
                     }
                 )
@@ -427,7 +439,7 @@ fun MainAppScreen(viewModel: BoosterViewModel) {
                                 .padding(12.dp)
                         ) {
                             LazyColumn(reverseLayout = true) {
-                                items(simulatedBoostLogs.reversed()) { logLine ->
+                                items(simulatedBoostLogs) { logLine ->
                                     Text(
                                         text = logLine,
                                         color = WarmWhite,
@@ -553,7 +565,7 @@ fun HeaderHUD(shizukuState: ShizukuState, profileIdx: Int, onHelpClick: () -> Un
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             text = when (shizukuState) {
-                                ShizukuState.AUTHORIZED -> "Shizuku: ONLINE (Root Active)"
+                                ShizukuState.AUTHORIZED -> "Shizuku: ONLINE (ADB Active)"
                                 ShizukuState.ADB_FALLBACK -> "Shizuku: ADB Fallback Mode"
                                 ShizukuState.NOT_RUNNING -> "Shizuku: OFFLINE (Chưa chạy)"
                                 ShizukuState.UNAUTHORIZED -> "Shizuku: Chờ cho phép"
@@ -811,7 +823,7 @@ fun DashboardTab(
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
                     Spacer(modifier = Modifier.height(10.dp))
 
                     // INTEGRATED STATUS SENSORS GRID (TEMPERATURE, SYSTEM KERNEL & BATTERY)
@@ -1265,7 +1277,7 @@ fun DashboardTab(
                         )
                     }
 
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
 
                     // Overlay / FPS Meter switch row
                     Row(
@@ -1309,7 +1321,7 @@ fun DashboardTab(
                         )
                     }
 
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
 
                     // Butler active monitor description
                     Column(
@@ -1577,8 +1589,7 @@ fun GameSpaceTab(
                 }
             }
         } else {
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(1),
+            LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.weight(1f)
             ) {
@@ -1746,7 +1757,7 @@ fun SettingsTweaksTab(
     var thermalDebugChecked by remember { mutableStateOf(sharedPrefs.getBoolean("thermal_debug", false)) }
     var fpsChecked by remember { mutableStateOf(sharedPrefs.getBoolean("fps_override", false)) }
     var dozeChecked by remember { mutableStateOf(sharedPrefs.getBoolean("doze_force", false)) }
-    var ramPurgeChecked by remember { mutableStateOf(sharedPrefs.getBoolean("ram_purge", false)) }
+    var ramPurgeChecked by remember { mutableStateOf(false) } // FIX M-02: no persistence — per-session only
     var stealthOverlayChecked by remember { mutableStateOf(sharedPrefs.getBoolean("stealth_overlay", false)) }
     var animationSpeedSelected by remember { mutableIntStateOf(sharedPrefs.getInt("animation_scale", 1)) } // 0 -> 0x (Tắt), 1 -> 0.5x (Nhanh), 2 -> 1.0x (Mặc định)
 
@@ -1957,7 +1968,7 @@ fun SettingsTweaksTab(
                         )
                     }
 
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
 
                     // Tweak 2: Thermal Override Limit
                     Row(
@@ -2010,7 +2021,7 @@ fun SettingsTweaksTab(
                         )
                     }
 
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
 
                     // Tweak 3: Peak Display Override (120Hz lock)
                     Row(
@@ -2067,7 +2078,7 @@ fun SettingsTweaksTab(
                         )
                     }
 
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
 
                     // Tweak 4: Net Latency Reduce (Doze Force Mode)
                     Row(
@@ -2120,7 +2131,7 @@ fun SettingsTweaksTab(
                         )
                     }
 
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
 
                     // Tweak 5: App cache sweeping (RAM Buffer trim)
                     Row(
@@ -2158,7 +2169,6 @@ fun SettingsTweaksTab(
                             onClick = {
                                 if (isAuthorized) {
                                     ramPurgeChecked = true
-                                    sharedPrefs.edit().putBoolean("ram_purge", true).apply()
                                     onTweakToggle("Dọn Caches Ứng Dụng", "pm trim-caches 4096000000")
                                 } else {
                                     showLockWarning()
@@ -2180,7 +2190,7 @@ fun SettingsTweaksTab(
                         }
                     }
 
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
 
                     // Tweak 6: System animation modifier
                     Column(
@@ -2308,7 +2318,7 @@ fun SettingsTweaksTab(
                         }
                     }
 
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
 
                     // Current size detected
                     Box(
@@ -2530,7 +2540,7 @@ fun SettingsTweaksTab(
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
                     Spacer(modifier = Modifier.height(12.dp))
 
                     // Live detected version
@@ -2611,7 +2621,7 @@ fun SettingsTweaksTab(
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
                     Spacer(modifier = Modifier.height(12.dp))
 
                     if (exemptedApps.isEmpty()) {
@@ -2676,7 +2686,7 @@ fun SettingsTweaksTab(
                                     )
                                 }
                             }
-                            Divider(color = CarbonElevated.copy(alpha = 0.3f), thickness = 0.5.dp)
+                            HorizontalDivider(color = CarbonElevated.copy(alpha = 0.3f), thickness = 0.5.dp)
                         }
                     }
 
@@ -2755,7 +2765,7 @@ fun SettingsTweaksTab(
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
                     Spacer(modifier = Modifier.height(10.dp))
 
                     Row(
@@ -2795,7 +2805,7 @@ fun SettingsTweaksTab(
                     )
 
                     Spacer(modifier = Modifier.height(12.dp))
-                    Divider(color = CarbonElevated, thickness = 0.5.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 0.5.dp)
                     Spacer(modifier = Modifier.height(10.dp))
 
                     Row(
@@ -2892,7 +2902,7 @@ fun SettingsTweaksTab(
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Divider(color = CarbonElevated, thickness = 1.dp)
+                    HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
                     Spacer(modifier = Modifier.height(10.dp))
 
                     // Live terminal console display
@@ -2927,14 +2937,14 @@ fun SettingsTweaksTab(
 
                      // Algorithm 1: Thread Director core affinity pinning
                      Text(
-                         text = "1. Intel Thread Director (P-Core Pinning)",
+                         text = "1. ARM Core Affinity (Big-Core Pinning)",
                          color = Color.White,
                          fontSize = 11.sp,
                          fontWeight = FontWeight.Bold
                      )
                      Spacer(modifier = Modifier.height(4.dp))
                      Text(
-                         text = "Kích hoạt cơ chế gán nhân hiệu năng của Intel/Macbook. Chọn một tiến trình đang hoạt động để ghim cứng lên các P-Cores lõi lớn (lõi 4-7) bằng lệnh taskset trực diện qua hệ quản trị Shizuku.",
+                         text = "Ghim tiến trình game lên các Big-Cores (lõi 4-7 trên ARM SoC như Snapdragon/Dimensity) bằng lệnh taskset. Giúp game ưu tiên dùng lõi hiệu năng cao nhất, giảm jitter và tăng frame pacing.",
                          color = SoftGreyText,
                          fontSize = 9.sp,
                          lineHeight = 12.sp
@@ -3035,13 +3045,13 @@ fun SettingsTweaksTab(
                                         Spacer(modifier = Modifier.width(6.dp))
                                         Text(app.packageName, color = SoftGreyText, fontSize = 8.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
-                                    Divider(color = CarbonElevated.copy(0.3f))
+                                    HorizontalDivider(color = CarbonElevated.copy(0.3f))
                                 }
                             }
                         }
                     }
 
-                    Divider(color = CarbonElevated, modifier = Modifier.padding(vertical = 10.dp))
+                    HorizontalDivider(color = CarbonElevated, modifier = Modifier.padding(vertical = 10.dp))
 
                      // Algorithm 2: Memory swap page compression
                      Text(
@@ -3052,7 +3062,7 @@ fun SettingsTweaksTab(
                      )
                      Spacer(modifier = Modifier.height(4.dp))
                      Text(
-                         text = "Kích hoạt cơ chế dồn nén bộ nhớ và dọn dẹp phân rã cache của Macbook M-series. Giải phóng tức thì các vùng nhớ đệm bị chia mảng và tối ưu hóa cấp phát RAM vật lý.",
+                         text = "Gọi pm trim-caches để xả toàn bộ bộ đệm ứng dụng tích luỹ và đo lường RAM khả dụng trước/sau để kiểm chứng kết quả thực tế trên thiết bị Android.",
                          color = SoftGreyText,
                          fontSize = 9.sp,
                          lineHeight = 12.sp
@@ -3099,7 +3109,7 @@ fun SettingsTweaksTab(
                         Text("QUÉT KIỂM TRA RAM VẬT LÝ", color = Color.Black, fontSize = 9.sp, fontWeight = FontWeight.Black)
                     }
 
-                    Divider(color = CarbonElevated, modifier = Modifier.padding(vertical = 10.dp))
+                    HorizontalDivider(color = CarbonElevated, modifier = Modifier.padding(vertical = 10.dp))
 
                     // Algorithm 3: Virtual Memory Sysctl Tuning
                     Text(
@@ -3147,7 +3157,7 @@ fun SettingsTweaksTab(
                         Text("ÁP DỤNG SYSCTL KERNEL CHUYÊN SÂU", color = Color.Black, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                     }
 
-                    Divider(color = CarbonElevated, modifier = Modifier.padding(vertical = 10.dp))
+                    HorizontalDivider(color = CarbonElevated, modifier = Modifier.padding(vertical = 10.dp))
 
                      // Algorithm 4: TjMax Safeguard simulator
                      Text(
@@ -3286,7 +3296,7 @@ fun SettingsTweaksTab(
                                         }
                                     }
                                 }
-                                Divider(color = CarbonElevated.copy(alpha = 0.4f))
+                                HorizontalDivider(color = CarbonElevated.copy(alpha = 0.4f))
                             }
                         }
                     }
@@ -3431,6 +3441,16 @@ fun OnboardingPermissionScreen(
 
     LaunchedEffect(Unit) {
         checkPermissions()
+    }
+
+    // FIX M-05: Re-check on every resume (user may have granted permission in Settings)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) checkPermissions()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     LazyColumn(
@@ -3648,13 +3668,15 @@ fun PermissionCheckRow(
 fun AddGameCustomDialog(
     installedApps: List<InstalledAppInfo>,
     onClose: () -> Unit,
-    onGameSaved: (name: String, packageId: String, profile: String, targetFps: Int) -> Unit
+    onGameSaved: (name: String, packageId: String, profile: String, targetFps: Int, bypassThermal: Boolean) -> Unit
 ) {
     var gameName by remember { mutableStateOf("") }
     var packageId by remember { mutableStateOf("") }
     var profileSelection by remember { mutableStateOf("balanced") }
     var targetFpsSelection by remember { mutableIntStateOf(120) }
     var appSearchQuery by remember { mutableStateOf("") }
+    // FIX M-01: bypassThermal was always false — add toggle so user can configure it
+    var bypassThermalChecked by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
 
@@ -3755,7 +3777,7 @@ fun AddGameCustomDialog(
                                         Text(app.packageName, color = SoftGreyText, fontSize = 8.sp, maxLines = 1)
                                     }
                                 }
-                                Divider(color = CarbonElevated.copy(0.3f), thickness = 0.5.dp)
+                                HorizontalDivider(color = CarbonElevated.copy(0.3f), thickness = 0.5.dp)
                             }
                         }
                     }
@@ -3793,7 +3815,7 @@ fun AddGameCustomDialog(
                     }
                 }
 
-                Divider(color = CarbonElevated, modifier = Modifier.padding(vertical = 2.dp))
+                HorizontalDivider(color = CarbonElevated, modifier = Modifier.padding(vertical = 2.dp))
 
                 OutlinedTextField(
                     value = gameName,
@@ -3877,13 +3899,41 @@ fun AddGameCustomDialog(
                         }
                     }
                 }
+
+                HorizontalDivider(color = CarbonElevated.copy(0.4f), modifier = Modifier.padding(vertical = 4.dp))
+
+                // FIX M-01: Thermal bypass toggle
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Bỏ Qua Giới Hạn Nhiệt (Thermal Bypass)",
+                            color = WarmWhite, fontSize = 11.sp, fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            "Tắt điều tiết CPU/GPU khi nhiệt độ cao. Chỉ dùng khi pin tốt và thiết bị tản nhiệt ổn.",
+                            color = SoftGreyText, fontSize = 9.sp
+                        )
+                    }
+                    Switch(
+                        checked = bypassThermalChecked,
+                        onCheckedChange = { bypassThermalChecked = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = AccentOrange,
+                            checkedTrackColor = AccentOrange.copy(alpha = 0.3f)
+                        )
+                    )
+                }
             }
         },
         confirmButton = {
             Button(
                 onClick = {
                     if (gameName.isNotBlank() && packageId.isNotBlank()) {
-                        onGameSaved(gameName, packageId, profileSelection, targetFpsSelection)
+                        onGameSaved(gameName, packageId, profileSelection, targetFpsSelection, bypassThermalChecked)
                     } else {
                         Toast.makeText(context, "Vui lòng chọn hoặc điền đầy đủ thông tin!", Toast.LENGTH_SHORT).show()
                     }
@@ -4014,7 +4064,7 @@ fun ShizukuIntegrationSheet(
                 }
 
                 item {
-                    Divider(color = CarbonElevated, modifier = Modifier.padding(vertical = 4.dp))
+                    HorizontalDivider(color = CarbonElevated, modifier = Modifier.padding(vertical = 4.dp))
                     Text(
                         text = "Lưu ý: Sau khi kích hoạt thành công Shizuku, bạn cần nhấn nút CẤP QUYỀN bên dưới để hệ thống tiến hành liên kết và đồng bộ dữ liệu của ứng dụng.",
                         color = CyberCyan,
@@ -4193,14 +4243,14 @@ fun AddWhitelistAppDialog(
                                         }
                                     }
                                 }
-                                Divider(color = CarbonElevated.copy(0.4f), thickness = 0.5.dp)
+                                HorizontalDivider(color = CarbonElevated.copy(0.4f), thickness = 0.5.dp)
                             }
                         }
                     }
                 }
                 
                 Spacer(modifier = Modifier.height(14.dp))
-                Divider(color = CarbonElevated, thickness = 1.dp)
+                HorizontalDivider(color = CarbonElevated, thickness = 1.dp)
                 Spacer(modifier = Modifier.height(10.dp))
                 
                 Text(
