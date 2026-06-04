@@ -23,15 +23,17 @@ jobs:
           distribution: 'temurin'
           cache: 'gradle'
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
       - name: Create Environment Config
         run: |
-          # FIX: Resilient — không fail khi .env.example bị thiếu trong git
           if [ -f ".env.example" ]; then
             cp .env.example .env
-            echo "✅ Copied .env.example → .env"
           else
             echo "GEMINI_API_KEY=placeholder_not_required_for_build" > .env
-            echo "⚠️  .env.example not found, created fallback .env"
           fi
 
       - name: Decode Debug Keystore
@@ -42,16 +44,8 @@ jobs:
             echo "Warning: debug.keystore.base64 not found, using default debug keystore."
           fi
 
-      - name: Grant Gradle Wrapper Permission
-        run: chmod +x ./gradlew
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '9.3.1'
-
       - name: Build Debug APK
-        run: ./gradlew assembleDebug
+        run: gradle assembleDebug
 
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
