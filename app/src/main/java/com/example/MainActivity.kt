@@ -395,7 +395,7 @@ fun MainAppScreen(viewModel: BoosterViewModel) {
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         CircularProgressIndicator(
-                            progress = simulProgress,
+                            progress = { simulProgress },
                             color = CyberGreen,
                             strokeWidth = 6.dp,
                             modifier = Modifier.size(90.dp)

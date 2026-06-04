@@ -1,30 +1,59 @@
 package com.example.util;
 
-import rikka.shizuku.Shizuku;
+import android.util.Log;
+import java.lang.reflect.Method;
 
 /**
- * Java wrapper for Shizuku.newProcess().
+ * Executes processes via Shizuku using reflection.
  *
- * Kotlin compiler enforces @RestrictTo visibility and reports newProcess() as
- * "private" in Shizuku 13.x — this is a false positive caused by how Kotlin
- * maps Android's @RestrictTo annotation. Java does not enforce @RestrictTo at
- * compile time, so calling through this helper bypasses the Kotlin error while
- * keeping the same runtime behaviour.
+ * Problem: Shizuku.newProcess() has private access in the 13.x API JAR,
+ * blocking both Kotlin and direct Java calls at compile time.
+ *
+ * Solution: Java reflection with setAccessible(true).
+ * Android's hidden-API restrictions (API 28+) only apply to platform classes
+ * (android.*, dalvik.*, java.*, etc.) — NOT to third-party libraries such as
+ * rikka.shizuku.*. So setAccessible() works here without restriction.
+ *
+ * The Method reference is cached after the first call to avoid repeated
+ * reflection overhead on every shell command.
  */
 public final class ShizukuProcessHelper {
+
+    private static final String TAG = "ShizukuProcessHelper";
+
+    // Cached to avoid getDeclaredMethod() overhead on every call
+    private static volatile Method sNewProcessMethod = null;
 
     private ShizukuProcessHelper() {}
 
     /**
-     * Creates a new process via the Shizuku service (equivalent to adb shell).
-     * Must only be called when Shizuku permission is already granted.
+     * Creates a new privileged process via the Shizuku service.
+     * Must be called only after Shizuku permission has been granted.
      *
-     * @param cmd shell command split into tokens, e.g. {"sh", "-c", "ls -la"}
-     * @param env environment variables, or null to inherit
-     * @param dir working directory, or null for default
-     * @return a Process whose stdin/stdout/stderr are connected to the remote process
+     * @param cmd  command split into tokens, e.g. {"sh", "-c", "whoami"}
+     * @param env  environment variables, or null to inherit from parent
+     * @param dir  working directory path, or null for default
+     * @return a Process connected to the privileged remote process
      */
     public static Process newProcess(String[] cmd, String[] env, String dir) throws Throwable {
-        return Shizuku.newProcess(cmd, env, dir);
+        Method method = sNewProcessMethod;
+        if (method == null) {
+            synchronized (ShizukuProcessHelper.class) {
+                method = sNewProcessMethod;
+                if (method == null) {
+                    Class<?> clazz = Class.forName("rikka.shizuku.Shizuku");
+                    method = clazz.getDeclaredMethod(
+                            "newProcess",
+                            String[].class,
+                            String[].class,
+                            String.class
+                    );
+                    method.setAccessible(true);
+                    sNewProcessMethod = method;
+                    Log.d(TAG, "Shizuku.newProcess() resolved via reflection");
+                }
+            }
+        }
+        return (Process) method.invoke(null, cmd, env, dir);
     }
 }
