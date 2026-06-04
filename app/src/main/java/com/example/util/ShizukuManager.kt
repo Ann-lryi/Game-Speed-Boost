@@ -201,7 +201,9 @@ object ShizukuManager {
      */
     private fun executeViaShizuku(command: String): Pair<Boolean, String> {
         return try {
-            val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
+            // Use Java wrapper — Kotlin compiler incorrectly restricts Shizuku.newProcess()
+        // due to @RestrictTo annotation mapping; Java enforces no such restriction at compile time.
+        val process = ShizukuProcessHelper.newProcess(arrayOf("sh", "-c", command), null, null)
             val outputBuilder = StringBuilder()
             val errorBuilder  = StringBuilder()
 
