@@ -42,9 +42,6 @@ android {
     targetCompatibility = JavaVersion.VERSION_17
   }
 
-  kotlinOptions {
-    jvmTarget = "17"
-  }
 
   buildFeatures {
     compose = true
@@ -59,6 +56,10 @@ android {
       }
     }
   }
+}
+
+kotlin {
+  jvmToolchain(17)
 }
 
 // Configure the Secrets Gradle Plugin
