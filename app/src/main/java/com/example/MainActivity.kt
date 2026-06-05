@@ -194,6 +194,8 @@ fun MainAppScreen(viewModel: BoosterViewModel) {
             if (showOnboarding) {
                 // Splash & Permission onboarding Gate Screen
                 OnboardingPermissionScreen(
+                    shizukuState = shizukuState,
+                    onRequestShizuku = { viewModel.requestShizukuAuthorization() },
                     onSkipRestrictMode = {
                         showOnboarding = false
                         sharedPrefsGlobal.edit().putBoolean("show_onboarding", false).apply()
@@ -202,7 +204,7 @@ fun MainAppScreen(viewModel: BoosterViewModel) {
                         showOnboarding = false
                         sharedPrefsGlobal.edit().putBoolean("show_onboarding", false).apply()
                         viewModel.checkStates()
-                        Toast.makeText(context, "Đã khởi động chế độ Tối ưu Cao Cấp!", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "✅ Đã sẵn sàng! Mọi quyền đã được cấp.", Toast.LENGTH_SHORT).show()
                     }
                 )
             } else {
@@ -3409,43 +3411,34 @@ fun SettingsTweaksTab(
 // Onboarding Permission Splash Gate UI Panel
 @Composable
 fun OnboardingPermissionScreen(
+    shizukuState: ShizukuState,
+    onRequestShizuku: () -> Unit,
     onSkipRestrictMode: () -> Unit,
     onFullAccessGranted: () -> Unit
 ) {
     val context = LocalContext.current
     var hasBatteryIgnore by remember { mutableStateOf(false) }
     var hasOverlayGranted by remember { mutableStateOf(false) }
-    var hasNotificationPermission by remember { mutableStateOf(false) }
+    var hasNotification by remember { mutableStateOf(false) }
 
     val notificationLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        hasNotificationPermission = isGranted
-    }
-    
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> hasNotification = granted }
+
     val checkPermissions = {
         val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-        hasBatteryIgnore = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            pm.isIgnoringBatteryOptimizations(context.packageName)
-        } else true
-        
-        hasOverlayGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Settings.canDrawOverlays(context)
-        } else true
-
-        hasNotificationPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        hasBatteryIgnore = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+            pm.isIgnoringBatteryOptimizations(context.packageName) else true
+        hasOverlayGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+            Settings.canDrawOverlays(context) else true
+        hasNotification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
             androidx.core.content.ContextCompat.checkSelfPermission(
-                context,
-                android.Manifest.permission.POST_NOTIFICATIONS
+                context, android.Manifest.permission.POST_NOTIFICATIONS
             ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        } else true
+        else true
     }
 
-    LaunchedEffect(Unit) {
-        checkPermissions()
-    }
-
-    // FIX M-05: Re-check on every resume (user may have granted permission in Settings)
+    // Re-check mỗi lần resume (user quay lại từ Settings)
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -3455,151 +3448,351 @@ fun OnboardingPermissionScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // Auto-request notification permission khi màn hình mở lần đầu
+    LaunchedEffect(Unit) {
+        checkPermissions()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotification) {
+            notificationLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    val isShizukuReady = shizukuState == ShizukuState.AUTHORIZED
+    val requiredDone = hasBatteryIgnore && hasOverlayGranted && hasNotification
+    val allDone = requiredDone && isShizukuReady
+
+    // Auto-proceed khi đủ 3 quyền bắt buộc + Shizuku (không cần bấm nút)
+    LaunchedEffect(allDone) {
+        if (allDone) onFullAccessGranted()
+    }
+
+    val grantedCount = listOf(hasBatteryIgnore, hasOverlayGranted, hasNotification, isShizukuReady).count { it }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .background(CarbonDark)
-            .padding(24.dp),
+            .padding(horizontal = 20.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+        contentPadding = PaddingValues(vertical = 32.dp)
     ) {
+        // ── Header ──────────────────────────────────────────────────────────
         item {
-            Box(
-                modifier = Modifier
-                    .size(90.dp)
-                    .clip(CircleShape)
-                    .background(CyberGreen.copy(0.1f))
-                    .border(2.dp, CyberGreen, CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Speed,
-                    contentDescription = "Shizuku Booster Logo",
-                    tint = CyberGreen,
-                    modifier = Modifier.size(46.dp)
-                )
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(
+                    modifier = Modifier
+                        .size(72.dp)
+                        .clip(CircleShape)
+                        .background(CyberGreen.copy(0.12f))
+                        .border(2.dp, CyberGreen, CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.Speed, null, tint = CyberGreen, modifier = Modifier.size(38.dp))
+                }
+                Spacer(Modifier.height(14.dp))
+                Text("CẤP QUYỀN ĐỂ BẮT ĐẦU",
+                    color = CyberGreen, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold,
+                    fontFamily = FontFamily.Monospace, letterSpacing = 1.5.sp)
+                Text("Game Speed Boost",
+                    color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Black)
+                Spacer(Modifier.height(6.dp))
+
+                // Progress bar
+                val progress = grantedCount / 4f
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(0.8f)
+                        .height(6.dp)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(CarbonElevated)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(progress)
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(if (allDone) CyberGreen else CyberCyan)
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                Text("$grantedCount / 4 bước hoàn thành",
+                    color = if (allDone) CyberGreen else SoftGreyText,
+                    fontSize = 11.sp, fontFamily = FontFamily.Monospace)
             }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            Text(
-                text = "THIẾT LẬP QUYÊN HẠN",
-                color = CyberGreen,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace,
-                letterSpacing = 1.5.sp
-            )
-
-            Text(
-                text = "Tối Ưu Hóa Tuyệt Đối",
-                color = Color.White,
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Black,
-                textAlign = TextAlign.Center
-            )
-
-            Text(
-                text = "Để hỗ trợ chơi game luôn ổn định, tránh bị hệ điều hành tắt chạy ngầm và vẽ bảng đo FPS, vui lòng cấp các quyền truy cập bên dưới.",
-                color = SoftGreyText,
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center,
-                lineHeight = 16.sp,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-            )
-
-            Spacer(modifier = Modifier.height(24.dp))
         }
 
-        // Checklist of permissions
+        // ── Quyền 1: Battery Optimization ──────────────────────────────────
         item {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                // Permission item 1: ignore battery optimization
-                PermissionCheckRow(
-                    title = "Bỏ hạn chế chạy ngầm (Battery Ignore)",
-                    description = "Cho phép app luôn chạy trong nền để tối ưu game đột phá, tránh bị đóng đột ngột",
-                    isGranted = hasBatteryIgnore,
-                    onClickRequest = {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            try {
-                                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                                    data = Uri.parse("package:${context.packageName}")
-                                }
-                                context.startActivity(intent)
-                            } catch (e: Exception) {
-                                Toast.makeText(context, "Thiết bị không hỗ trợ Intent trực tiếp. Vui lòng thiết lập thủ công tại cài đặt.", Toast.LENGTH_LONG).show()
-                            }
-                        }
-                    }
-                )
-
-                // Permission item 2: Overlay Draw over other apps
-                PermissionCheckRow(
-                    title = "Vẽ đè lên ứng dụng khác (Overlay Drawing)",
-                    description = "Cần thiết để bong bóng đo tốc độ FPS có thể hiển thị đè lên màn hình trò chơi",
-                    isGranted = hasOverlayGranted,
-                    onClickRequest = {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).apply {
+            OnboardingStep(
+                step = 1,
+                title = "Bỏ giới hạn chạy nền",
+                subtitle = "Battery Optimization Ignore",
+                description = "Cho phép service chạy liên tục khi chơi game mà không bị hệ thống kill.",
+                isGranted = hasBatteryIgnore,
+                buttonText = "MỞ CÀI ĐẶT PIN",
+                onGrant = {
+                    try {
+                        context.startActivity(
+                            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
                                 data = Uri.parse("package:${context.packageName}")
                             }
-                            context.startActivity(intent)
-                        }
+                        )
+                    } catch (e: Exception) {
+                        context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                     }
-                )
+                }
+            )
+        }
 
-                // Permission item 3: Post Notifications (Android 13+)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    PermissionCheckRow(
-                        title = "Quyền gửi thông báo (Notifications)",
-                        description = "Cần thiết để Shizuku Service duy trì thông báo đo trạng thái định kỳ",
-                        isGranted = hasNotificationPermission,
-                        onClickRequest = {
-                            notificationLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        // ── Quyền 2: Overlay ────────────────────────────────────────────────
+        item {
+            OnboardingStep(
+                step = 2,
+                title = "Hiển thị đè ứng dụng",
+                subtitle = "Display Over Other Apps",
+                description = "Cần thiết để viên thuốc FPS hiện lên trên màn hình game.",
+                isGranted = hasOverlayGranted,
+                buttonText = "MỞ CÀI ĐẶT OVERLAY",
+                onGrant = {
+                    context.startActivity(
+                        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).apply {
+                            data = Uri.parse("package:${context.packageName}")
                         }
                     )
                 }
-            }
-
-            Spacer(modifier = Modifier.height(32.dp))
+            )
         }
 
-        // Action Buttons
+        // ── Quyền 3: Notification ────────────────────────────────────────────
         item {
-            Button(
-                onClick = {
-                    checkPermissions()
-                    if (hasBatteryIgnore && hasOverlayGranted) {
-                        onFullAccessGranted()
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotificationPermission) {
+            OnboardingStep(
+                step = 3,
+                title = "Thông báo hệ thống",
+                subtitle = "POST_NOTIFICATIONS (Android 13+)",
+                description = "Service cần thông báo foreground để hệ thống không kill khi chơi game.",
+                isGranted = hasNotification,
+                buttonText = "CẤP QUYỀN THÔNG BÁO",
+                onGrant = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        notificationLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
+            )
+        }
+
+        // ── Quyền 4: Shizuku ─────────────────────────────────────────────────
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (isShizukuReady) CyberGreen.copy(0.08f) else CarbonSurface
+                ),
+                border = BorderStroke(
+                    1.5.dp,
+                    if (isShizukuReady) CyberGreen.copy(0.5f) else CarbonElevated
+                )
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(28.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    if (isShizukuReady) CyberGreen
+                                    else CarbonElevated
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                if (isShizukuReady) "✓" else "4",
+                                color = if (isShizukuReady) Color.Black else SoftGreyText,
+                                fontSize = 12.sp, fontWeight = FontWeight.Black
+                            )
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Kết nối Shizuku",
+                                color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            Text("ADB Privilege Bridge",
+                                color = SoftGreyText, fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace)
+                        }
+                        if (isShizukuReady) {
+                            Text("● ONLINE", color = CyberGreen, fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                        }
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+
+                    when (shizukuState) {
+                        ShizukuState.AUTHORIZED -> {
+                            Text("✅ Shizuku đã kết nối. Tất cả tính năng ADB sẵn sàng.",
+                                color = CyberGreen, fontSize = 12.sp)
+                        }
+                        ShizukuState.NOT_INSTALLED -> {
+                            Text("Shizuku chưa được cài. Tải từ Play Store hoặc GitHub.",
+                                color = SoftGreyText, fontSize = 11.sp)
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = {
+                                        try {
+                                            context.startActivity(Intent(Intent.ACTION_VIEW,
+                                                Uri.parse("market://details?id=moe.shizuku.privileged.api")))
+                                        } catch (e: Exception) {
+                                            context.startActivity(Intent(Intent.ACTION_VIEW,
+                                                Uri.parse("https://play.google.com/store/apps/details?id=moe.shizuku.privileged.api")))
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = CyberGreen),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("PLAY STORE", color = Color.Black, fontSize = 10.sp, fontWeight = FontWeight.Black) }
+                                Button(
+                                    onClick = {
+                                        context.startActivity(Intent(Intent.ACTION_VIEW,
+                                            Uri.parse("https://github.com/RikkaApps/Shizuku/releases")))
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = CarbonElevated),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("GITHUB", color = CyberGreen, fontSize = 10.sp, fontWeight = FontWeight.Black) }
+                            }
+                        }
+                        ShizukuState.NOT_RUNNING -> {
+                            Text("Shizuku đã cài nhưng chưa khởi động dịch vụ.",
+                                color = SoftGreyText, fontSize = 11.sp)
+                            Spacer(Modifier.height(6.dp))
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = CarbonDark),
+                                border = BorderStroke(1.dp, CarbonElevated)
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    Text("Cách khởi động Shizuku:",
+                                        color = CyberCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                    Text("1. Bật Tùy chọn nhà phát triển",
+                                        color = SoftGreyText, fontSize = 10.sp)
+                                    Text("2. Bật Gỡ lỗi không dây (Wireless Debugging)",
+                                        color = SoftGreyText, fontSize = 10.sp)
+                                    Text("3. Mở Shizuku → chọn Khởi động qua Wireless Debugging",
+                                        color = SoftGreyText, fontSize = 10.sp)
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = {
+                                        try {
+                                            context.startActivity(
+                                                context.packageManager.getLaunchIntentForPackage(
+                                                    "moe.shizuku.privileged.api"
+                                                ) ?: Intent(Intent.ACTION_VIEW,
+                                                    Uri.parse("market://details?id=moe.shizuku.privileged.api"))
+                                            )
+                                        } catch (e: Exception) { }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = CyberGreen),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("MỞ SHIZUKU", color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Black) }
+                                Button(
+                                    onClick = {
+                                        try {
+                                            context.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                                        } catch (e: Exception) { }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = CarbonElevated),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("TUỲ CHỌN NHÀ PT", color = CyberCyan, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+                            }
+                        }
+                        ShizukuState.UNAUTHORIZED -> {
+                            Text("Shizuku đang chạy nhưng chưa cấp quyền cho app này.",
+                                color = SoftGreyText, fontSize = 11.sp)
+                            Spacer(Modifier.height(8.dp))
+                            Button(
+                                onClick = onRequestShizuku,
+                                colors = ButtonDefaults.buttonColors(containerColor = CyberGreen),
+                                shape = RoundedCornerShape(6.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("CẤP QUYỀN SHIZUKU NGAY", color = Color.Black, fontSize = 12.sp,
+                                    fontWeight = FontWeight.Black)
+                            }
+                        }
+                        else -> {
+                            Text("Đang kiểm tra trạng thái Shizuku...",
+                                color = SoftGreyText, fontSize = 11.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Nút hành động ───────────────────────────────────────────────────
+        item {
+            Spacer(Modifier.height(4.dp))
+            if (requiredDone && !isShizukuReady) {
+                // 3 quyền xong, còn Shizuku
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = CyberCyan.copy(0.08f)),
+                    border = BorderStroke(1.dp, CyberCyan.copy(0.3f))
+                ) {
+                    Row(modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Info, null, tint = CyberCyan, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(10.dp))
+                        Text("3 quyền bắt buộc đã đủ. Kết nối Shizuku để mở khoá toàn bộ tính năng ADB.",
+                            color = CyberCyan, fontSize = 11.sp, lineHeight = 14.sp)
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = onFullAccessGranted,
+                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = CyberCyan),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("VÀO APP (CHẾ ĐỘ CƠ BẢN)", color = CarbonDark, fontSize = 13.sp,
+                        fontWeight = FontWeight.Black)
+                }
+            } else if (!requiredDone) {
+                Button(
+                    onClick = {
+                        checkPermissions()
+                        if (!hasBatteryIgnore) {
+                            try {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                        data = Uri.parse("package:${context.packageName}")
+                                    })
+                            } catch (e: Exception) { }
+                        } else if (!hasOverlayGranted) {
+                            context.startActivity(
+                                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).apply {
+                                    data = Uri.parse("package:${context.packageName}")
+                                })
+                        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotification) {
                             notificationLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
                         }
-                    } else {
-                        Toast.makeText(context, "Hãy cấp đầy đủ các quyền tối thiểu để khởi động an toàn!", Toast.LENGTH_LONG).show()
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(50.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = CyberGreen),
-                shape = RoundedCornerShape(8.dp)
-            ) {
-                Text(
-                    text = "BẮT ĐẦU CHẾ ĐỘ HOÀN HẢO",
-                    color = Color.Black,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Black,
-                    letterSpacing = 0.5.sp
-                )
+                    },
+                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = CarbonElevated),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("CẤP QUYỀN CÒN LẠI →", color = CyberGreen, fontSize = 13.sp,
+                        fontWeight = FontWeight.Black)
+                }
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
-
+            Spacer(Modifier.height(10.dp))
             Text(
-                text = "TIẾP TỤC DÙNG CHẾ ĐỘ HẠN CHẾ (CƠ BẢN)",
-                color = CyberCyan,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
+                "BỎ QUA — TIẾP TỤC CHẾ ĐỘ HẠN CHẾ",
+                color = SoftGreyText.copy(0.6f), fontSize = 10.sp,
                 fontFamily = FontFamily.Monospace,
                 modifier = Modifier
                     .clickable { onSkipRestrictMode() }
@@ -3610,60 +3803,64 @@ fun OnboardingPermissionScreen(
 }
 
 @Composable
-fun PermissionCheckRow(
+private fun OnboardingStep(
+    step: Int,
     title: String,
+    subtitle: String,
     description: String,
     isGranted: Boolean,
-    onClickRequest: () -> Unit
+    buttonText: String,
+    onGrant: () -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = CarbonSurface),
-        border = BorderStroke(1.dp, if (isGranted) CyberGreen.copy(0.4f) else CarbonElevated)
+        colors = CardDefaults.cardColors(
+            containerColor = if (isGranted) CyberGreen.copy(0.07f) else CarbonSurface
+        ),
+        border = BorderStroke(1.5.dp, if (isGranted) CyberGreen.copy(0.45f) else CarbonElevated)
     ) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(14.dp),
+            modifier = Modifier.padding(14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = if (isGranted) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                contentDescription = "Status icon",
-                tint = if (isGranted) CyberGreen else SoftGreyText,
-                modifier = Modifier.size(24.dp)
-            )
-
-            Spacer(modifier = Modifier.width(14.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(CircleShape)
+                    .background(if (isGranted) CyberGreen else CarbonElevated),
+                contentAlignment = Alignment.Center
+            ) {
                 Text(
-                    text = title,
-                    color = Color.White,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = description,
-                    color = SoftGreyText,
-                    fontSize = 10.sp,
-                    lineHeight = 12.sp
+                    if (isGranted) "✓" else "$step",
+                    color = if (isGranted) Color.Black else SoftGreyText,
+                    fontSize = 13.sp, fontWeight = FontWeight.Black
                 )
             }
-
-            if (!isGranted) {
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Text(subtitle, color = if (isGranted) CyberGreen else SoftGreyText,
+                    fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                Spacer(Modifier.height(2.dp))
+                Text(description, color = SoftGreyText, fontSize = 10.sp, lineHeight = 13.sp)
+            }
+            Spacer(Modifier.width(8.dp))
+            if (isGranted) {
+                Icon(Icons.Default.CheckCircle, null, tint = CyberGreen, modifier = Modifier.size(26.dp))
+            } else {
                 Button(
-                    onClick = onClickRequest,
-                    colors = ButtonDefaults.buttonColors(containerColor = CarbonElevated),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                    shape = RoundedCornerShape(4.dp)
+                    onClick = onGrant,
+                    colors = ButtonDefaults.buttonColors(containerColor = CyberGreen),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(6.dp)
                 ) {
-                    Text("CẤP", color = CyberGreen, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    Text(buttonText, color = Color.Black, fontSize = 9.sp, fontWeight = FontWeight.Black)
                 }
             }
         }
     }
 }
+
 
 // Dialog: Add Custom game context
 @Composable
