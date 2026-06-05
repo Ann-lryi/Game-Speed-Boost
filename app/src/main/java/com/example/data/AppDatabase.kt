@@ -20,6 +20,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "booster_database"
                 )
+                .fallbackToDestructiveMigration(dropAllTables = true)
                 .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
                 .build()
                 INSTANCE = instance

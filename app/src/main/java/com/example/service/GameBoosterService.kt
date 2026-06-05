@@ -27,6 +27,8 @@ class GameBoosterService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private var statsJob: Job? = null
+    private val database by lazy { AppDatabase.getDatabase(this) }
+    private val repository by lazy { BoosterRepository(database.boosterDao()) }
 
     private lateinit var windowManager: WindowManager
     private var floatingView: TextView? = null
@@ -192,8 +194,6 @@ class GameBoosterService : Service() {
         statsJob?.cancel()
 
         statsJob = serviceScope.launch(Dispatchers.IO) {
-            val database   = AppDatabase.getDatabase(this@GameBoosterService)
-            val repository = BoosterRepository(database.boosterDao())
             delay(500)
 
             while (isActive) {
@@ -208,13 +208,16 @@ class GameBoosterService : Service() {
                         val gameFps = ShizukuManager.getGameFpsViaGfxInfo(pkgName)
                         if (gameFps >= 0) currentFps = gameFps
 
-                        val isAppRunning = ShizukuManager.isAppRunning(this@GameBoosterService, pkgName)
-                                || ShizukuManager.getAppPid(pkgName) > 0
+                        // pidof via Shizuku is reliable; ActivityManager.getRunningAppProcesses()
+                    // returns empty for non-system apps on Android 8+, even more restricted on 16
+                    val pid = ShizukuManager.getAppPid(pkgName)
+                    val isAppRunning = pid > 0 ||
+                            ShizukuManager.isAppRunning(this@GameBoosterService, pkgName)
 
                         if (isAppRunning) {
-                            handleGameActive(pkgName, cpuLoad, ramPercent, batteryTemp, repository)
+                            handleGameActive(pkgName, cpuLoad, ramPercent, batteryTemp)
                         } else {
-                            handleGameClosed(repository)
+                            handleGameClosed()
                         }
                     }
 
@@ -231,13 +234,11 @@ class GameBoosterService : Service() {
         }
     }
 
-    // FIX C-01: Added `suspend` — was calling suspend fun repository.insertLog from non-suspend
     private suspend fun handleGameActive(
         packageName: String,
         cpuLoad: Int,
         ramPercent: Int,
-        batteryTemp: Int,
-        repository: BoosterRepository
+        batteryTemp: Int
     ) {
         val pid = ShizukuManager.getAppPid(packageName)
 
@@ -280,8 +281,7 @@ class GameBoosterService : Service() {
         }
     }
 
-    // FIX C-01: Added `suspend`
-    private suspend fun handleGameClosed(repository: BoosterRepository) {
+    private suspend fun handleGameClosed() {
         isGameActive    = false
         lastButlerPhase = ""
         butlerStatus    = "Game closed - resetting"

@@ -31,7 +31,7 @@ data class ConsoleCommand(
 
 object ShizukuManager {
     private const val TAG = "ShizukuManager"
-    const val SHIZUKU_PACKAGE_NAME = "rikka.shizuku"
+    const val SHIZUKU_PACKAGE_NAME = "moe.shizuku.privileged.api"
     private const val SHELL_TIMEOUT_SECONDS = 15L
     private const val MAX_CONSOLE_LOGS = 100
 

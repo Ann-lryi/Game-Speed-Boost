@@ -11,12 +11,13 @@
     <uses-permission
         android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
+    <!-- WRITE_SECURE_SETTINGS only effective via Shizuku/ADB — declared for lint suppression -->
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
 
     <queries>
-        <package android:name="rikka.shizuku" />
-        <!-- Allow querying apps for game selection -->
+        <!-- FIX: Correct Shizuku APP package (not library namespace rikka.shizuku) -->
+        <package android:name="moe.shizuku.privileged.api" />
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
@@ -33,6 +34,20 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.MyApplication">
 
+        <!--
+            FIX CRITICAL: ShizukuProvider is REQUIRED for Shizuku binder IPC.
+            Without this, Shizuku.addBinderReceivedListenerSticky() never fires
+            and pingBinder() always returns false — app can never detect Shizuku.
+            Authority format: ${applicationId}.shizuku (AGP substitutes applicationId automatically).
+        -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:multiprocess="false"
+            tools:ignore="ExportedContentProvider" />
+
         <service
             android:name=".service.GameBoosterService"
             android:enabled="true"
@@ -40,7 +55,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Game performance monitoring, floating overlay, and memory optimization." />
+                android:value="Game performance monitoring, floating overlay, and system optimization." />
         </service>
 
         <activity

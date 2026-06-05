@@ -3963,7 +3963,7 @@ fun ShizukuIntegrationSheet(
     val context = LocalContext.current
     val clipManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
 
-    val startCmd = "adb shell sh /sdcard/Android/data/rikka.shizuku/files/start.sh"
+    val startCmd = "adb shell sh /sdcard/Android/data/moe.shizuku.privileged.api/files/start.sh"
     val secureSettingCmd = "adb shell pm grant ${context.packageName} android.permission.WRITE_SECURE_SETTINGS"
 
     AlertDialog(
