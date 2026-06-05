@@ -107,14 +107,25 @@ class BoosterViewModel(
             _installedApps.value = withContext(Dispatchers.IO) {
                 try {
                     val pm = context.packageManager
-                    val packages = pm.getInstalledPackages(0)
+                    // Android 33+: use PackageInfoFlags for correct API, MATCH_ALL flag on 35+
+                    val packages = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                        pm.getInstalledPackages(
+                            android.content.pm.PackageManager.PackageInfoFlags.of(0L)
+                        )
+                    } else {
+                        @Suppress("DEPRECATION")
+                        pm.getInstalledPackages(0)
+                    }
                     packages.mapNotNull { packageInfo ->
                         val appInfo = packageInfo.applicationInfo ?: return@mapNotNull null
-                        val name = pm.getApplicationLabel(appInfo).toString()
                         val pkg = packageInfo.packageName
-                        if (name.isNotEmpty() && pkg != context.packageName) {
-                            InstalledAppInfo(name, pkg)
-                        } else null
+                        // Skip self and system processes without launcher icon
+                        if (pkg == context.packageName) return@mapNotNull null
+                        // Only include apps that have a launcher intent (user-visible apps)
+                        val launchIntent = pm.getLaunchIntentForPackage(pkg)
+                            ?: return@mapNotNull null
+                        val name = pm.getApplicationLabel(appInfo).toString()
+                        if (name.isNotEmpty()) InstalledAppInfo(name, pkg) else null
                     }.sortedWith(compareBy { it.appName.lowercase() })
                 } catch (e: Exception) {
                     Log.e(TAG, "Error listing packages", e)

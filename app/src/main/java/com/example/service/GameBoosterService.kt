@@ -140,8 +140,8 @@ class GameBoosterService : Service() {
     private fun resetSystemSettings() {
         if (ShizukuManager.state.value != ShizukuState.AUTHORIZED) return
         try {
-            ShizukuManager.executeShell("wm size reset")
-            ShizukuManager.executeShell("wm density reset")
+            // ONLY reset power mode — service never modifies wm size/density.
+            // Calling wm size/density reset here would destroy user's custom DPI.
             ShizukuManager.executeShell("cmd power set-mode 0")
         } catch (e: Exception) {
             Log.e(TAG, "Error during cleanup reset", e)

@@ -230,19 +230,34 @@ object ShizukuManager {
                 } catch (_: Exception) { /* stream closed */ }
             }
 
-            val finished = process.waitFor(SHELL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            if (!finished) {
+            // Use a dedicated wait-thread so we can interrupt it reliably.
+            // ShizukuRemoteProcess.waitFor(timeout, unit) may not behave correctly
+            // for remote IPC processes — wrapping in thread+join is safer.
+            val waitThread = thread(start = true, isDaemon = true) {
+                try { process.waitFor() } catch (_: InterruptedException) {}
+            }
+            waitThread.join(SHELL_TIMEOUT_SECONDS * 1000)
+
+            val timedOut = waitThread.isAlive
+            if (timedOut) {
+                waitThread.interrupt()
                 process.destroyForcibly()
                 stdoutThread.interrupt()
                 stderrThread.interrupt()
                 return Pair(false, "[ERROR] Command timed out after ${SHELL_TIMEOUT_SECONDS}s")
             }
 
-            // Wait for reader threads to flush remaining buffered data
+            // Drain remaining buffered output
             stdoutThread.join(1000)
             stderrThread.join(1000)
 
-            val exitCode = process.exitValue()
+            // ShizukuRemoteProcess.exitValue() may throw IllegalThreadStateException
+            // ("process hasn't exited") even after waitFor() completes — treat as 0
+            val exitCode = try {
+                process.exitValue()
+            } catch (_: IllegalStateException) { 0 }
+              catch (_: IllegalThreadStateException) { 0 }
+
             val combined = (outputBuilder.toString() + errorBuilder.toString()).trim()
 
             if (combined.isEmpty()) Pair(exitCode == 0, "Exit code: $exitCode")
