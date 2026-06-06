@@ -6,10 +6,10 @@ import android.util.Log
 import android.os.SystemClock
 import java.io.File
 
-/**
- * Reads hardware topology WITHOUT any special permissions.
- * Sources: /proc/cpuinfo, /sys/devices/system/cpu/*, /sys/class/kgsl/*, /proc/meminfo
- */
+// Reads hardware topology WITHOUT any special permissions.
+// Sources: /proc/cpuinfo, /sys/devices/system/cpu/cpuN/cpufreq/
+//          /sys/class/kgsl/kgsl-3d0/ (Adreno GPU), /proc/meminfo
+// All reads work without root or Shizuku.
 object DeviceProfiler {
 
     private const val TAG = "DeviceProfiler"
