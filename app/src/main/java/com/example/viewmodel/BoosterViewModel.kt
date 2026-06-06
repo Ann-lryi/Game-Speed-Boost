@@ -14,6 +14,7 @@ import com.example.data.AppDatabase
 import com.example.data.BoostLog
 import com.example.data.BoosterRepository
 import com.example.data.UserGame
+import com.example.engine.GameAdaptiveEngine
 import com.example.service.GameBoosterService
 import com.example.util.ShizukuManager
 import com.example.util.ShizukuState
@@ -68,6 +69,10 @@ class BoosterViewModel(
     private val _ufsVersion = MutableStateFlow("")
     val ufsVersionState = _ufsVersion.asStateFlow()
 
+    // Engine state (null when no game is active)
+    val engineState: kotlinx.coroutines.flow.StateFlow<GameAdaptiveEngine.EngineState?>?
+        get() = null  // Read from service indirectly via notification/overlay
+
     // FIX H-04: SharedFlow to surface silent errors back to UI
     private val _addGameError = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val addGameError: SharedFlow<String> = _addGameError.asSharedFlow()
@@ -105,34 +110,62 @@ class BoosterViewModel(
     fun loadInstalledApps() {
         viewModelScope.launch {
             _installedApps.value = withContext(Dispatchers.IO) {
+                // queryIntentActivities(MAIN/LAUNCHER) is what Android launchers use.
+                // It is far more reliable than getInstalledPackages on Android 14-16
+                // because it resolves through the intent system which respects QUERY_ALL_PACKAGES
+                // permission correctly, unlike getLaunchIntentForPackage which can return null.
                 try {
-                    val pm = context.packageManager
-                    // Android 33+: use PackageInfoFlags for correct API, MATCH_ALL flag on 35+
-                    val packages = if (android.os.Build.VERSION.SDK_INT >= 33) {
-                        pm.getInstalledPackages(
-                            android.content.pm.PackageManager.PackageInfoFlags.of(0L)
+                    val pm     = context.packageManager
+                    val intent = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
+                        addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+                    }
+                    val activities = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                        pm.queryIntentActivities(
+                            intent,
+                            android.content.pm.PackageManager.ResolveInfoFlags.of(0L)
                         )
                     } else {
                         @Suppress("DEPRECATION")
-                        pm.getInstalledPackages(0)
+                        pm.queryIntentActivities(intent, 0)
                     }
-                    packages.mapNotNull { packageInfo ->
-                        val appInfo = packageInfo.applicationInfo ?: return@mapNotNull null
-                        val pkg = packageInfo.packageName
-                        // Skip self and system processes without launcher icon
+                    Log.d(TAG, "queryIntentActivities returned \${activities.size} launcher apps")
+                    activities.mapNotNull { info ->
+                        val ai  = info.activityInfo?.applicationInfo ?: return@mapNotNull null
+                        val pkg = ai.packageName
                         if (pkg == context.packageName) return@mapNotNull null
-                        // Only include apps that have a launcher intent (user-visible apps)
-                        val launchIntent = pm.getLaunchIntentForPackage(pkg)
-                            ?: return@mapNotNull null
-                        val name = pm.getApplicationLabel(appInfo).toString()
-                        if (name.isNotEmpty()) InstalledAppInfo(name, pkg) else null
-                    }.sortedWith(compareBy { it.appName.lowercase() })
+                        val name = try { pm.getApplicationLabel(ai).toString().trim() }
+                                   catch (_: Exception) { return@mapNotNull null }
+                        if (name.isEmpty()) null else InstalledAppInfo(name, pkg)
+                    }.distinctBy { it.packageName }
+                     .sortedWith(compareBy { it.appName.lowercase() })
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error listing packages", e)
+                    Log.e(TAG, "queryIntentActivities failed: \${e.message}")
                     emptyList()
                 }
             }
         }
+    }
+
+        /** Maps a package to InstalledAppInfo, returns null if the package should be excluded. */
+    private fun buildAppInfo(
+        pm: android.content.pm.PackageManager,
+        pkg: String,
+        appInfo: android.content.pm.ApplicationInfo
+    ): InstalledAppInfo? {
+        // Skip this app itself
+        if (pkg == context.packageName) return null
+
+        // Skip pure pre-installed system apps (Settings, Phone, etc.)
+        // Keep updated system apps (Google Play, YouTube, etc.) and user-installed apps
+        val isSystem = (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+        val isUpdatedSystem = (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+        if (isSystem && !isUpdatedSystem) return null
+
+        val name = try {
+            pm.getApplicationLabel(appInfo).toString().trim()
+        } catch (e: Exception) { return null }
+
+        return if (name.isNotEmpty()) InstalledAppInfo(name, pkg) else null
     }
 
     private fun loadExemptedApps() {

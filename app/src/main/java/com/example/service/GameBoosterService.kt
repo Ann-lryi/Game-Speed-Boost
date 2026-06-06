@@ -7,17 +7,18 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
-import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
-import com.example.R
 import com.example.data.AppDatabase
 import com.example.data.BoostLog
 import com.example.data.BoosterRepository
+import com.example.engine.GameAdaptiveEngine
+import com.example.engine.StateBackupManager
+import com.example.util.DeviceProfiler
 import com.example.util.ShizukuManager
 import com.example.util.ShizukuState
 import com.example.util.SystemMetrics
@@ -25,441 +26,268 @@ import kotlinx.coroutines.*
 
 class GameBoosterService : Service() {
 
-    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private var statsJob: Job? = null
-    private val database by lazy { AppDatabase.getDatabase(this) }
+    // ── FIX auto-close: CoroutineExceptionHandler prevents crashes from
+    //    killing the service; SupervisorJob isolates failures per-child ────────
+    private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        Log.e(TAG, "Unhandled coroutine error (service continues): ${throwable.message}", throwable)
+    }
+    private val serviceScope = CoroutineScope(
+        Dispatchers.Default + SupervisorJob() + exceptionHandler
+    )
+    private var statsJob   : Job? = null
+    private var engineJob  : Job? = null
+
+    // ── DB / Repo — class-level lazy (not recreated per loop restart) ─────────
+    private val database   by lazy { AppDatabase.getDatabase(this) }
     private val repository by lazy { BoosterRepository(database.boosterDao()) }
 
-    private lateinit var windowManager: WindowManager
-    private var floatingView: TextView? = null
+    // ── Hardware + Engine ─────────────────────────────────────────────────────
+    private lateinit var deviceProfile : DeviceProfiler.DeviceProfile
+    private var adaptiveEngine         : GameAdaptiveEngine? = null
 
-    // FIX C-01 cascade: renamed to avoid shadowing companion property
-    private var overlayVisible = false
+    // ── Overlay ───────────────────────────────────────────────────────────────
+    private lateinit var windowManager : WindowManager
+    private var floatingView           : TextView? = null
+    private var overlayVisible         = false
 
-    private var targetPackageName: String? = null
-    private var targetGameName: String? = null
-    private var targetCustomFps: Int = 60
-    private var targetProfile: String = "balanced"
-    private var targetBypassThermal: Boolean = false
+    // ── Game session state ────────────────────────────────────────────────────
+    @Volatile private var targetPackageName  : String? = null
+    @Volatile private var targetGameName     : String? = null
+    @Volatile private var targetCustomFps    : Int     = 60
+    @Volatile private var targetProfile      : String  = "balanced"
+    @Volatile private var targetBypassThermal: Boolean = false
+    @Volatile private var isGameActive       : Boolean = false
+    @Volatile private var butlerStatus       : String  = "Sẵn sàng"
+    private var currentFps                   : Int     = -1
 
-    // FIX C-01 / H-03: @Volatile for cross-thread access on Dispatchers.IO
-    @Volatile private var isGameActive = false
-    @Volatile private var lastButlerPhase = ""
-    @Volatile private var butlerStatus = "Ready"
-
-    // FIX H-01: currentFps now comes from getGameFpsViaGfxInfo (cross-process), not Choreographer
-    private var currentFps = -1
-
-    private val backupReadAheadKbList = mutableMapOf<String, String>()
+    private val backupReadAheadKb = mutableMapOf<String, String>()
 
     companion object {
-        const val CHANNEL_ID = "game_speed_boost_channel"
-        const val NOTIFICATION_ID = 4529
-        const val ACTION_START = "ACTION_START_BOOSTER_SERVICE"
-        const val ACTION_STOP = "ACTION_STOP_BOOSTER_SERVICE"
+        const val CHANNEL_ID         = "game_speed_boost_channel"
+        const val NOTIFICATION_ID    = 4529
+        const val ACTION_START       = "ACTION_START_BOOSTER_SERVICE"
+        const val ACTION_STOP        = "ACTION_STOP_BOOSTER_SERVICE"
         const val ACTION_TOGGLE_OVERLAY = "ACTION_TOGGLE_OVERLAY"
         const val ACTION_LAUNCH_GAME = "ACTION_LAUNCH_GAME"
 
-        const val EXTRA_GAME_NAME = "EXTRA_GAME_NAME"
-        const val EXTRA_PACKAGE_NAME = "EXTRA_PACKAGE_NAME"
-        const val EXTRA_CUSTOM_FPS = "EXTRA_CUSTOM_FPS"
+        const val EXTRA_GAME_NAME           = "EXTRA_GAME_NAME"
+        const val EXTRA_PACKAGE_NAME        = "EXTRA_PACKAGE_NAME"
+        const val EXTRA_CUSTOM_FPS          = "EXTRA_CUSTOM_FPS"
         const val EXTRA_PERFORMANCE_PROFILE = "EXTRA_PERFORMANCE_PROFILE"
-        const val EXTRA_BYPASS_THERMAL = "EXTRA_BYPASS_THERMAL"
+        const val EXTRA_BYPASS_THERMAL      = "EXTRA_BYPASS_THERMAL"
 
         @Volatile var isServiceRunning = false
-        // FIX H-03: Externally readable overlay state for ViewModel.checkStates() sync
-        @Volatile var isOverlayActive = false
+        @Volatile var isOverlayActive  = false
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "GameBoosterService created")
         createNotificationChannel()
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        windowManager  = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        deviceProfile  = DeviceProfiler.getProfile(this)
+        adaptiveEngine = GameAdaptiveEngine(this, deviceProfile)
         SystemMetrics.resetCpuCache()
+        Log.i(TAG, "Service created — SoC: ${deviceProfile.socModel}, GPU: ${deviceProfile.gpuModel}, Cores: ${deviceProfile.coreTopology.totalCores}")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action ?: ACTION_START
-        Log.d(TAG, "Action: $action")
-
-        when (action) {
+        when (intent?.action ?: ACTION_START) {
             ACTION_START -> {
                 isServiceRunning = true
-                startForegroundServiceCompat()
-                startStatsPollingLoop()
+                startForegroundCompat()
+                startStatsLoop()
                 applyUfsTweaks()
+                notifyUser("🟢 Game Speed Boost đang chạy", "Giám sát hệ thống đã bật")
             }
             ACTION_LAUNCH_GAME -> {
-                targetPackageName = intent?.getStringExtra(EXTRA_PACKAGE_NAME)
-                targetGameName    = intent?.getStringExtra(EXTRA_GAME_NAME)
-                targetCustomFps   = intent?.getIntExtra(EXTRA_CUSTOM_FPS, 60) ?: 60
-                targetProfile     = intent?.getStringExtra(EXTRA_PERFORMANCE_PROFILE) ?: "balanced"
-                targetBypassThermal = intent?.getBooleanExtra(EXTRA_BYPASS_THERMAL, false) ?: false
-                isGameActive  = true
-                lastButlerPhase = ""
-                butlerStatus  = "Launching: $targetGameName"
+                val pkg     = intent?.getStringExtra(EXTRA_PACKAGE_NAME)   ?: return START_STICKY
+                val name    = intent.getStringExtra(EXTRA_GAME_NAME)       ?: pkg
+                targetPackageName   = pkg
+                targetGameName      = name
+                targetCustomFps     = intent.getIntExtra(EXTRA_CUSTOM_FPS, 60)
+                targetProfile       = intent.getStringExtra(EXTRA_PERFORMANCE_PROFILE) ?: "balanced"
+                targetBypassThermal = intent.getBooleanExtra(EXTRA_BYPASS_THERMAL, false)
+                isGameActive        = true
+                butlerStatus        = "Đang khởi động: $name"
 
-                isServiceRunning = true
-                startForegroundServiceCompat()
-                startStatsPollingLoop()
-                applyUfsTweaks()
+                if (!isServiceRunning) {
+                    isServiceRunning = true
+                    startForegroundCompat()
+                    startStatsLoop()
+                    applyUfsTweaks()
+                }
+                // Capture system state BEFORE first tweak (StateBackupManager)
+                StateBackupManager.captureIfAbsent()
+                startEngineLoop(pkg, name)
+                notifyUser("🎮 Đã phát hiện: $name", "Thuật toán thích nghi đã kích hoạt")
             }
-            ACTION_STOP -> {
-                shutdownService()
-                return START_NOT_STICKY
-            }
-            ACTION_TOGGLE_OVERLAY -> toggleFloatingOverlay()
+            ACTION_STOP       -> { gracefulStop(); return START_NOT_STICKY }
+            ACTION_TOGGLE_OVERLAY -> toggleOverlay()
         }
         return START_STICKY
     }
 
-    private fun shutdownService() {
-        isServiceRunning = false
-        isGameActive = false
+    // ── Stats polling loop (basic metrics, always running) ────────────────────
+
+    private fun startStatsLoop() {
         statsJob?.cancel()
-
-        // FIX C-02: Shell cleanup off Main Thread; stop only after cleanup completes
-        serviceScope.launch(Dispatchers.IO) {
-            restoreUfsTweaks()
-            resetSystemSettings()
-            withContext(Dispatchers.Main) {
-                removeFloatingView()
-                stopSelf()
-            }
-        }
-        // Cancel remaining scope after giving cleanup a window
-        serviceScope.launch {
-            delay(3000)
-            serviceScope.cancel()
-        }
-    }
-
-    private fun resetSystemSettings() {
-        if (ShizukuManager.state.value != ShizukuState.AUTHORIZED) return
-        try {
-            // ONLY reset power mode — service never modifies wm size/density.
-            // Calling wm size/density reset here would destroy user's custom DPI.
-            ShizukuManager.executeShell("cmd power set-mode 0")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during cleanup reset", e)
-        }
-    }
-
-    private fun startForegroundServiceCompat() {
-        val notification = createStatsNotification("Game Speed Boost Active", "Monitoring system resources...")
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, notification,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
-    }
-
-    private fun createStatsNotification(title: String, content: String): Notification {
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(title)
-            .setContentText(content)
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setColor(Color.parseColor("#00E676"))
-            .setOngoing(true)
-            .setContentIntent(pendingIntent)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setCategory(Notification.CATEGORY_SERVICE)
-            .build()
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID, "Game Speed Boost Monitor", NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Real-time system monitoring for gaming"
-                enableLights(true); lightColor = Color.GREEN; setShowBadge(false)
-            }
-            getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
-        }
-    }
-
-    private fun startStatsPollingLoop() {
-        statsJob?.cancel()
-
         statsJob = serviceScope.launch(Dispatchers.IO) {
-            delay(500)
-
+            delay(600)
             while (isActive) {
                 try {
-                    val ramPercent   = SystemMetrics.getRamUsagePercent(this@GameBoosterService)
-                    val batteryTemp  = SystemMetrics.getBatteryTempCelsius(this@GameBoosterService)
-                    val cpuLoad      = SystemMetrics.getCpuLoadPercent()
+                    val cpu  = SystemMetrics.getCpuLoadPercent()
+                    val ram  = SystemMetrics.getRamUsagePercent(this@GameBoosterService)
+                    val temp = SystemMetrics.getBatteryTempCelsius(this@GameBoosterService)
+                    val fps  = targetPackageName?.let {
+                        ShizukuManager.getGameFpsViaGfxInfo(it).takeIf { f -> f >= 0 } ?: currentFps
+                    } ?: -1
+                    currentFps = fps
 
-                    val pkgName = targetPackageName
-                    if (pkgName != null && isGameActive) {
-                        // FIX H-01: Real cross-process FPS via dumpsys gfxinfo
-                        val gameFps = ShizukuManager.getGameFpsViaGfxInfo(pkgName)
-                        if (gameFps >= 0) currentFps = gameFps
-
-                        // pidof via Shizuku is reliable; ActivityManager.getRunningAppProcesses()
-                    // returns empty for non-system apps on Android 8+, even more restricted on 16
-                    val pid = ShizukuManager.getAppPid(pkgName)
-                    val isAppRunning = pid > 0 ||
-                            ShizukuManager.isAppRunning(this@GameBoosterService, pkgName)
-
-                        if (isAppRunning) {
-                            handleGameActive(pkgName, cpuLoad, ramPercent, batteryTemp)
-                        } else {
-                            handleGameClosed()
-                        }
-                    }
-
-                    updateNotification(cpuLoad, ramPercent, batteryTemp)
-                    updateOverlay(cpuLoad, ramPercent)
-
-                } catch (e: CancellationException) {
-                    break
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error in stats loop", e)
-                }
+                    updateNotification(cpu, ram, temp, fps)
+                    updateOverlay(cpu, ram, fps)
+                } catch (e: CancellationException) { break }
+                  catch (e: Exception) { Log.w(TAG, "Stats loop error: ${e.message}") }
                 delay(2000)
             }
         }
     }
 
-    private suspend fun handleGameActive(
-        packageName: String,
-        cpuLoad: Int,
-        ramPercent: Int,
-        batteryTemp: Int
-    ) {
-        val pid = ShizukuManager.getAppPid(packageName)
+    // ── Adaptive engine loop (game-specific, per session) ────────────────────
 
-        when {
-            batteryTemp >= 45 -> {
-                if (lastButlerPhase != "thermal_emergency") {
-                    lastButlerPhase = "thermal_emergency"
-                    executeButlerCommand("cmd power set-mode 0", "Power saving mode")
-                    if (pid > 0) executeButlerCommand("renice -n 0 -p $pid", "Reset priority")
-                    repository.insertLog(BoostLog(
-                        actionName = "⚠️ Thermal Emergency",
-                        details = "Battery temp reached ${batteryTemp}°C. Activating emergency cooling."
-                    ))
-                }
-                butlerStatus = "⚠️ Thermal limit: ${batteryTemp}°C"
-            }
-            batteryTemp >= 40 -> {
-                if (lastButlerPhase != "balanced") {
-                    lastButlerPhase = "balanced"
-                    if (pid > 0) executeButlerCommand("renice -n -5 -p $pid", "Elevated priority")
-                    repository.insertLog(BoostLog(
-                        actionName = "⚖️ Balanced Mode",
-                        details = "Battery temp ${batteryTemp}°C. Applied balanced profile."
-                    ))
-                }
-                butlerStatus = "⚖️ Balanced: ${batteryTemp}°C"
-            }
-            else -> {
-                if (lastButlerPhase != "performance") {
-                    lastButlerPhase = "performance"
-                    executeButlerCommand("cmd power set-mode 1", "Performance mode")
-                    if (pid > 0) executeButlerCommand("renice -n -10 -p $pid", "High priority")
-                    repository.insertLog(BoostLog(
-                        actionName = "🚀 Performance Mode",
-                        details = "Battery temp ${batteryTemp}°C. Applied performance profile."
-                    ))
-                }
-                butlerStatus = "🚀 Performance: ${batteryTemp}°C"
+    private fun startEngineLoop(packageName: String, gameName: String) {
+        engineJob?.cancel()
+        engineJob = serviceScope.launch(Dispatchers.IO) {
+            val engine = adaptiveEngine ?: return@launch
+            delay(1500) // give game process time to start
+
+            var lastLoad = GameAdaptiveEngine.GameLoad.IDLE
+            var gameMissingCycles = 0
+
+            while (isActive && isGameActive) {
+                try {
+                    val pid = DeviceProfiler.findPidFromProcFs(packageName)
+                        .takeIf { it > 0 }
+                        ?: ShizukuManager.getAppPid(packageName)
+
+                    if (pid <= 0) {
+                        gameMissingCycles++
+                        if (gameMissingCycles >= 5) {
+                            // Game closed — restore and stop
+                            handleGameEnded(packageName, gameName)
+                            break
+                        }
+                    } else {
+                        gameMissingCycles = 0
+                        val state = engine.tick(packageName)
+                        butlerStatus = state.statusLine
+
+                        // Notify user on significant load transitions
+                        if (state.load != lastLoad) {
+                            val significant = lastLoad == GameAdaptiveEngine.GameLoad.IDLE ||
+                                state.load == GameAdaptiveEngine.GameLoad.CRITICAL ||
+                                (lastLoad.ordinal - state.load.ordinal).let { kotlin.math.abs(it) } >= 2
+                            if (significant) {
+                                notifyUser(
+                                    "${state.load.emoji} ${state.load.label}",
+                                    state.statusLine
+                                )
+                            }
+                            lastLoad = state.load
+                        }
+                    }
+                } catch (e: CancellationException) { break }
+                  catch (e: Exception) { Log.w(TAG, "Engine tick error: ${e.message}") }
+                delay(500)
             }
         }
     }
 
-    private suspend fun handleGameClosed() {
-        isGameActive    = false
-        lastButlerPhase = ""
-        butlerStatus    = "Game closed - resetting"
+    private suspend fun handleGameEnded(pkg: String, name: String) {
+        Log.i(TAG, "Game ended: $name")
+        isGameActive = false
+        butlerStatus = "Game đã đóng — đang khôi phục hệ thống"
 
-        restoreUfsTweaks()
-        resetSystemSettings()
+        // Restore SYSTEM tweaks (not user prefs)
+        withContext(Dispatchers.IO) {
+            adaptiveEngine?.onGameEnd()
+            StateBackupManager.restoreSystemTweaks()
+            restoreUfsTweaks()
+        }
 
         repository.insertLog(BoostLog(
-            actionName = "🧼 Game Session Ended",
-            details = "Game ($targetGameName) closed. All system tweaks have been reverted to defaults."
+            actionName = "🧼 Kết thúc phiên: $name",
+            details    = "Tất cả tham số hệ thống đã được khôi phục về trạng thái trước khi chơi"
         ))
+
+        notifyUser("✅ $name đã đóng", "Hệ thống khôi phục hoàn tất")
 
         targetPackageName = null
         targetGameName    = null
     }
 
-    private fun executeButlerCommand(command: String, description: String) {
-        if (ShizukuManager.state.value != ShizukuState.AUTHORIZED) return
-        val result = ShizukuManager.executeShell(command)
-        Log.d(TAG, "Butler [$description]: success=${result.isSuccess}, output=${result.output.take(100)}")
-    }
+    // ── Graceful stop (user-initiated only) ───────────────────────────────────
 
-    private fun updateNotification(cpuLoad: Int, ramPercent: Int, batteryTemp: Int) {
-        try {
-            val title = if (isGameActive && targetGameName != null) "🎮 Monitoring: $targetGameName"
-            else "🎮 Game Speed Boost Active"
+    private fun gracefulStop() {
+        isServiceRunning = false
+        isGameActive     = false
+        isOverlayActive  = false
+        engineJob?.cancel()
+        statsJob?.cancel()
+        removeFloatingView()
 
-            val fpsStr  = if (currentFps >= 0) "FPS: ${currentFps} | " else ""
-            val tempStr = if (batteryTemp > 0) "Temp: ${batteryTemp}°C" else ""
-            val cpuStr  = if (cpuLoad >= 0) "CPU: ${cpuLoad}%" else "CPU: --"
-            val ramStr  = if (ramPercent >= 0) "RAM: ${ramPercent}%" else "RAM: --"
-            val content = "$fpsStr$cpuStr | $ramStr | $tempStr${if (isGameActive) " | $butlerStatus" else ""}"
-
-            val notification = createStatsNotification(title, content)
-            getSystemService(NotificationManager::class.java)?.notify(NOTIFICATION_ID, notification)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error updating notification", e)
-        }
-    }
-
-    private fun updateOverlay(cpuLoad: Int, ramPercent: Int) {
-        if (!overlayVisible || floatingView == null) return
-        try {
-            val stealthPrefs = getSharedPreferences("gaming_booster_tweaks_prefs", Context.MODE_PRIVATE)
-            val isStealthMode = stealthPrefs.getBoolean("stealth_overlay", false)
-
-            serviceScope.launch(Dispatchers.Main) {
-                if (isGameActive && isStealthMode && targetGameName != null) {
-                    floatingView?.visibility = android.view.View.GONE
-                } else {
-                    floatingView?.visibility = android.view.View.VISIBLE
-                    val fpsDisplay = if (currentFps >= 0) "${currentFps} FPS • " else ""
-                    val text = if (isGameActive && targetGameName != null) {
-                        "⚡ $targetGameName • ${fpsDisplay}CPU ${if (cpuLoad >= 0) cpuLoad else "--"}% • RAM ${if (ramPercent >= 0) ramPercent else "--"}%"
-                    } else {
-                        "🟢 Game Speed Boost • CPU ${if (cpuLoad >= 0) cpuLoad else "--"}% • RAM ${if (ramPercent >= 0) ramPercent else "--"}%"
-                    }
-                    floatingView?.text = text
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error updating overlay", e)
-        }
-    }
-
-    private fun toggleFloatingOverlay() {
-        if (overlayVisible) removeFloatingView() else showFloatingView()
-    }
-
-    private fun showFloatingView() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-            !android.provider.Settings.canDrawOverlays(this)) {
-            Log.e(TAG, "Overlay permission not granted"); return
-        }
-        try {
-            removeFloatingView()
-            val density = resources.displayMetrics.density
-            val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                val metrics = resources.displayMetrics
-                x = (metrics.widthPixels - (260 * density).toInt()) / 2
-                y = (32 * density).toInt()
-            }
-
-            val capsuleBg = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                cornerRadius = 24 * density
-                setColor(Color.parseColor("#E60B0E14"))
-                setStroke((1 * density).toInt(), Color.parseColor("#8000E676"))
-            }
-
-            val overlayView = TextView(this).apply {
-                id = android.R.id.text1
-                setTextColor(Color.parseColor("#00E676"))
-                background = capsuleBg
-                setPadding((14 * density).toInt(), (5 * density).toInt(),
-                    (14 * density).toInt(), (5 * density).toInt())
-                textSize = 9.5f
-                typeface = android.graphics.Typeface.MONOSPACE
-                text = "🟢 Game Speed Boost • Starting..."
-                gravity = Gravity.CENTER
-            }
-
-            var initialX = 0; var initialY = 0
-            var initialTouchX = 0f; var initialTouchY = 0f
-            overlayView.setOnTouchListener { view, event ->
-                when (event.action) {
-                    android.view.MotionEvent.ACTION_DOWN -> {
-                        initialX = params.x; initialY = params.y
-                        initialTouchX = event.rawX; initialTouchY = event.rawY; true
-                    }
-                    android.view.MotionEvent.ACTION_MOVE -> {
-                        params.x = initialX + (event.rawX - initialTouchX).toInt()
-                        params.y = initialY + (event.rawY - initialTouchY).toInt()
-                        try { windowManager.updateViewLayout(view, params) }
-                        catch (e: Exception) { Log.e(TAG, "Error updating overlay position", e) }
-                        true
-                    }
-                    else -> false
-                }
-            }
-
-            floatingView = overlayView
-            windowManager.addView(overlayView, params)
-            overlayVisible   = true
-            isOverlayActive  = true  // FIX H-03: sync companion state
-            Log.d(TAG, "Floating overlay shown")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to show floating overlay", e)
-        }
-    }
-
-    private fun removeFloatingView() {
-        if (overlayVisible && floatingView != null) {
+        serviceScope.launch(Dispatchers.IO) {
             try {
-                floatingView?.setOnTouchListener(null)
-                windowManager.removeView(floatingView)
+                adaptiveEngine?.onGameEnd()
+                StateBackupManager.restoreSystemTweaks()
+                restoreUfsTweaks()
             } catch (e: Exception) {
-                Log.e(TAG, "Error removing overlay", e)
+                Log.e(TAG, "Cleanup error: ${e.message}")
+            } finally {
+                withContext(Dispatchers.Main) { stopSelf() }
             }
-            floatingView     = null
-            overlayVisible   = false
-            isOverlayActive  = false  // FIX H-03: sync companion state
         }
     }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isServiceRunning = false
+        isGameActive     = false
+        isOverlayActive  = false
+        engineJob?.cancel()
+        statsJob?.cancel()
+        removeFloatingView()
+        // FIX: don't cancel serviceScope here — let cleanup coroutine finish
+        // then let it naturally complete
+        @OptIn(DelicateCoroutinesApi::class)
+        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
+            try {
+                adaptiveEngine?.onGameEnd()
+                StateBackupManager.restoreSystemTweaks()
+                restoreUfsTweaks()
+            } catch (_: Exception) {}
+        }
+        serviceScope.cancel()
+    }
+
+    // ── UFS tweaks ────────────────────────────────────────────────────────────
 
     private fun applyUfsTweaks() {
         if (ShizukuManager.state.value != ShizukuState.AUTHORIZED) return
         val version = SystemMetrics.detectUfsVersion(this)
-        val kbValue = when {
-            version.startsWith("4.") -> "16384"
-            version.startsWith("3.") -> "8192"
-            version.startsWith("2.") -> "4096"
-            else -> return
-        }
-        val blockDevices = listOf("sda", "sdb", "sdc", "sdd", "sde", "sdf", "dm-0")
-        if (backupReadAheadKbList.isEmpty()) {
-            for (dev in blockDevices) {
-                val path = "/sys/block/$dev/queue/read_ahead_kb"
+        val kbValue = when { version.startsWith("4.") -> "16384"; version.startsWith("3.") -> "8192"; version.startsWith("2.") -> "4096"; else -> return }
+        val devs    = listOf("sda","sdb","sdc","sdd","sde","sdf","dm-0")
+        if (backupReadAheadKb.isEmpty()) {
+            devs.forEach { dev ->
+                val p = "/sys/block/$dev/queue/read_ahead_kb"
                 try {
-                    val readRes = ShizukuManager.executeShell("cat $path")
-                    if (readRes.isSuccess && readRes.output.isNotBlank()) {
-                        val v = readRes.output.trim()
-                        if (v.all { it.isDigit() }) backupReadAheadKbList[path] = v
-                    }
+                    val v = ShizukuManager.executeShell("cat $p").output.trim()
+                    if (v.isNotBlank() && v.all { it.isDigit() }) backupReadAheadKb[p] = v
                 } catch (_: Exception) {}
             }
         }
-        for (dev in blockDevices) {
+        devs.forEach { dev ->
             try { ShizukuManager.executeShell("echo $kbValue > /sys/block/$dev/queue/read_ahead_kb") }
             catch (_: Exception) {}
         }
@@ -467,31 +295,152 @@ class GameBoosterService : Service() {
 
     private fun restoreUfsTweaks() {
         if (ShizukuManager.state.value != ShizukuState.AUTHORIZED) return
-        for ((path, oldVal) in backupReadAheadKbList) {
-            try { ShizukuManager.executeShell("echo $oldVal > $path") }
-            catch (e: Exception) { Log.e(TAG, "Error restoring $path", e) }
+        backupReadAheadKb.forEach { (path, old) ->
+            try { ShizukuManager.executeShell("echo $old > $path") } catch (_: Exception) {}
         }
-        backupReadAheadKbList.clear()
+        backupReadAheadKb.clear()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        Log.d(TAG, "GameBoosterService destroyed")
+    // ── Notification ──────────────────────────────────────────────────────────
 
-        isServiceRunning = false
-        isGameActive     = false
-        isOverlayActive  = false
-        statsJob?.cancel()
+    private fun startForegroundCompat() {
+        val n = buildNotification("Game Speed Boost", "Dịch vụ đang hoạt động")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+            startForeground(NOTIFICATION_ID, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        else
+            startForeground(NOTIFICATION_ID, n)
+    }
 
-        // FIX C-02: Don't block Main Thread — remove UI immediately, cleanup IO async
-        removeFloatingView()
-        serviceScope.cancel()
+    private fun notifyUser(title: String, body: String) {
+        serviceScope.launch(Dispatchers.Main) {
+            try {
+                getSystemService(NotificationManager::class.java)
+                    ?.notify(NOTIFICATION_ID, buildNotification(title, body))
+            } catch (_: Exception) {}
+        }
+    }
 
-        // Detached IO coroutine — survives serviceScope cancellation
-        @OptIn(DelicateCoroutinesApi::class)
-        kotlinx.coroutines.GlobalScope.launch(Dispatchers.IO) {
-            restoreUfsTweaks()
-            resetSystemSettings()
+    private fun updateNotification(cpu: Int, ram: Int, temp: Int, fps: Int) {
+        val title = if (isGameActive && targetGameName != null)
+            "🎮 ${targetGameName}" else "🟢 Game Speed Boost"
+        val fpsStr  = if (fps >= 0) "FPS:$fps " else ""
+        val cpuStr  = if (cpu >= 0) "CPU:${cpu}%" else "CPU:--"
+        val ramStr  = if (ram >= 0) "RAM:${ram}%" else "RAM:--"
+        val tempStr = if (temp > 0) " ${temp}°C" else ""
+        val butler  = if (isGameActive) " • $butlerStatus" else ""
+        serviceScope.launch(Dispatchers.Main) {
+            try {
+                getSystemService(NotificationManager::class.java)
+                    ?.notify(NOTIFICATION_ID, buildNotification(title, "$fpsStr$cpuStr $ramStr$tempStr$butler"))
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun buildNotification(title: String, text: String): Notification {
+        val pi = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(title).setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setColor(Color.parseColor("#00E676")).setOngoing(true)
+            .setContentIntent(pi).setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, "Game Speed Boost", NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Giám sát và tối ưu hiệu năng game"
+                enableLights(true); lightColor = Color.GREEN; setShowBadge(false)
+            }
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(ch)
+        }
+    }
+
+    // ── Overlay ───────────────────────────────────────────────────────────────
+
+    private fun toggleOverlay() { if (overlayVisible) removeFloatingView() else showFloatingView() }
+
+    private fun showFloatingView() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+            !android.provider.Settings.canDrawOverlays(this)) return
+        try {
+            removeFloatingView()
+            val d = resources.displayMetrics.density
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                val m = resources.displayMetrics
+                x = (m.widthPixels - (260 * d).toInt()) / 2
+                y = (32 * d).toInt()
+            }
+            val bg = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                cornerRadius = 24 * d
+                setColor(Color.parseColor("#E60B0E14"))
+                setStroke((1 * d).toInt(), Color.parseColor("#8000E676"))
+            }
+            val tv = TextView(this).apply {
+                setTextColor(Color.parseColor("#00E676"))
+                background = bg
+                setPadding((14*d).toInt(), (5*d).toInt(), (14*d).toInt(), (5*d).toInt())
+                textSize = 9.5f
+                typeface = android.graphics.Typeface.MONOSPACE
+                text = "⚡ Game Speed Boost"
+                gravity = Gravity.CENTER
+            }
+            var ix=0; var iy=0; var tx=0f; var ty=0f
+            tv.setOnTouchListener { v, e ->
+                when (e.action) {
+                    android.view.MotionEvent.ACTION_DOWN -> { ix=params.x; iy=params.y; tx=e.rawX; ty=e.rawY; true }
+                    android.view.MotionEvent.ACTION_MOVE -> {
+                        params.x = ix + (e.rawX-tx).toInt()
+                        params.y = iy + (e.rawY-ty).toInt()
+                        try { windowManager.updateViewLayout(v, params) } catch (_: Exception) {}
+                        true
+                    }
+                    else -> false
+                }
+            }
+            floatingView = tv
+            windowManager.addView(tv, params)
+            overlayVisible  = true
+            isOverlayActive = true
+        } catch (e: Exception) { Log.e(TAG, "Overlay error: ${e.message}") }
+    }
+
+    private fun removeFloatingView() {
+        if (!overlayVisible || floatingView == null) return
+        try {
+            floatingView?.setOnTouchListener(null)
+            windowManager.removeView(floatingView)
+        } catch (_: Exception) {}
+        floatingView    = null
+        overlayVisible  = false
+        isOverlayActive = false
+    }
+
+    private fun updateOverlay(cpu: Int, ram: Int, fps: Int) {
+        if (!overlayVisible || floatingView == null) return
+        serviceScope.launch(Dispatchers.Main) {
+            val fStr = if (fps >= 0) "${fps}FPS • " else ""
+            val cStr = if (cpu >= 0) "CPU${cpu}%" else "--"
+            val rStr = if (ram >= 0) " RAM${ram}%" else ""
+            val load = adaptiveEngine?.state?.value?.load
+            val lStr = load?.emoji ?: "⚡"
+            floatingView?.text = "$lStr $fStr$cStr$rStr"
         }
     }
 
