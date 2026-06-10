@@ -82,7 +82,9 @@ data class HardwareSnapshot(
      * Phát hiện điểm nghẽn chính
      */
     fun detectBottleneck(): String {
-        val cpuLoad = cpuClusters.filter { it.isOnline }.averageOrNull { it.loadPercent } ?: 0f
+        val cpuLoad = cpuClusters.filter { it.isOnline }.let { list ->
+            if (list.isNotEmpty()) list.map { it.loadPercent }.average().toFloat() else 0f
+        }
         val gpuLoad = gpuData?.loadPercent ?: 0f
         val ramUsage = memoryData?.ramUsagePercent ?: 0f
         

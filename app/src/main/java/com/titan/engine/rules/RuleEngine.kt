@@ -2,6 +2,7 @@ package com.titan.engine.rules
 
 import com.titan.core.TitanCore
 import com.titan.core.TitanError
+import com.titan.engine.models.GameProfile
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,7 +19,7 @@ import org.json.JSONObject
 class RuleEngine(private val titanCore: TitanCore) {
 
     // Trạng thái hiện tại của engine
-    private val _engineState = MutableStateFlow(EngineState.IDLE)
+    private val _engineState = MutableStateFlow<EngineState>(EngineState.IDLE)
     val engineState: StateFlow<EngineState> = _engineState.asStateFlow()
 
     // Profile đang hoạt động
@@ -117,7 +118,7 @@ class RuleEngine(private val titanCore: TitanCore) {
     }
 
     private fun triggerEmergencyStop() {
-        titanCore.resetToSafeMode()
+        titanCore.rollbackChanges() // Rollback thay vì resetToSafeMode (chưa có)
         _engineState.value = EngineState.EMERGENCY_STOP
     }
 
@@ -185,16 +186,18 @@ class RuleEngine(private val titanCore: TitanCore) {
     private fun executeDecision(action: Action) {
         when (action) {
             is Action.THERMAL_THROTTLE -> {
-                titanCore.adjustClocks(scaleFactor = action.percentage, mode = ClockMode.SAFE)
+                titanCore.writeSysFS("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", "1500000") // Ví dụ giảm xung
             }
             is Action.PERFORMANCE_BOOST -> {
-                titanCore.adjustClocks(scaleFactor = action.percentage, mode = ClockMode.AGGRESSIVE)
+                titanCore.writeSysFS("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", "2400000") // Ví dụ tăng xung
             }
             is Action.GPU_PRIORITY_BOOST -> {
-                titanCore.boostGPU(scaleFactor = action.percentage)
+                // Tăng ưu tiên GPU (giả lập)
+                titanCore.writeSysFS("/sys/class/kgsl/kgsl-3d0/pwrlevel", "0")
             }
             is Action.OPTIMIZE_EFFICIENCY -> {
-                titanCore.optimizeEfficiency()
+                // Tối ưu hiệu suất năng lượng
+                titanCore.writeSysFS("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "schedutil")
             }
             is Action.MAINTAIN -> {
                 // Không làm gì cả, giữ nguyên trạng thái
@@ -204,11 +207,8 @@ class RuleEngine(private val titanCore: TitanCore) {
 
     private fun applySafetyDefaults() {
         // Thiết lập các giới hạn cứng mặc định cho mọi thiết bị
-        titanCore.setHardLimits(
-            maxCpuTemp = 90.0f,
-            maxGpuTemp = 85.0f,
-            minFpsThreshold = 20.0f
-        )
+        // Giả lập bằng cách ghi các giá trị an toàn
+        titanCore.writeSysFS("/sys/class/thermal/thermal_zone0/mode", "enabled")
     }
 
     fun startGameLoop() {
@@ -217,7 +217,7 @@ class RuleEngine(private val titanCore: TitanCore) {
     }
 
     fun stopGameLoop() {
-        titanCore.restoreDefaults()
+        titanCore.rollbackChanges()
         _engineState.value = EngineState.READY
         metricBuffer.clear()
     }
