@@ -1,8 +1,8 @@
 package com.titan.engine.rules
 
 import com.titan.core.TitanCore
-import com.titan.core.TitanError
-import com.titan.engine.models.GameProfile
+import com.titan.core.model.GameProfile
+import com.titan.core.model.TitanError
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -53,7 +53,7 @@ class RuleEngine(private val titanCore: TitanCore) {
             _engineState.value = EngineState.PROFILE_LOADED(profile.gameName)
             Result.success(profile)
         } catch (e: Exception) {
-            _engineState.value = EngineState.ERROR(TitanError.ProfileParseError)
+            _engineState.value = EngineState.ERROR(TitanError.ProfileLoadError(e.message ?: "Unknown"))
             Result.failure(e)
         }
     }
