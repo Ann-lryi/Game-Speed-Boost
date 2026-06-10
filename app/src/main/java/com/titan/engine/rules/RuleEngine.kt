@@ -53,7 +53,7 @@ class RuleEngine(private val titanCore: TitanCore) {
             _engineState.value = EngineState.PROFILE_LOADED(profile.gameName)
             Result.success(profile)
         } catch (e: Exception) {
-            _engineState.value = EngineState.ERROR(TitanError.PROFILE_PARSE_ERROR(e.message ?: "Unknown"))
+            _engineState.value = EngineState.ERROR(TitanError.ProfileParseError)
             Result.failure(e)
         }
     }
@@ -96,7 +96,7 @@ class RuleEngine(private val titanCore: TitanCore) {
 
     private fun getAverage(key: String): Float {
         val list = metricBuffer[key] ?: return 0f
-        return list.average().toFloat()
+        return if (list.isNotEmpty()) list.average().toFloat() else 0f
     }
 
     /**
@@ -118,7 +118,7 @@ class RuleEngine(private val titanCore: TitanCore) {
     }
 
     private fun triggerEmergencyStop() {
-        titanCore.rollbackChanges() // Rollback thay vì resetToSafeMode (chưa có)
+        titanCore.rollbackChanges()
         _engineState.value = EngineState.EMERGENCY_STOP
     }
 
@@ -186,10 +186,12 @@ class RuleEngine(private val titanCore: TitanCore) {
     private fun executeDecision(action: Action) {
         when (action) {
             is Action.THERMAL_THROTTLE -> {
-                titanCore.writeSysFS("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", "1500000") // Ví dụ giảm xung
+                // Giảm xung CPU xuống mức an toàn
+                titanCore.writeSysFS("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", "1500000")
             }
             is Action.PERFORMANCE_BOOST -> {
-                titanCore.writeSysFS("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", "2400000") // Ví dụ tăng xung
+                // Tăng xung CPU lên mức cao
+                titanCore.writeSysFS("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", "2400000")
             }
             is Action.GPU_PRIORITY_BOOST -> {
                 // Tăng ưu tiên GPU (giả lập)
@@ -207,7 +209,6 @@ class RuleEngine(private val titanCore: TitanCore) {
 
     private fun applySafetyDefaults() {
         // Thiết lập các giới hạn cứng mặc định cho mọi thiết bị
-        // Giả lập bằng cách ghi các giá trị an toàn
         titanCore.writeSysFS("/sys/class/thermal/thermal_zone0/mode", "enabled")
     }
 
