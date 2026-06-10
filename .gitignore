@@ -1,76 +1,30 @@
-```
-# Build outputs
-build/
-.gradle/
-target/
-
-# Dependencies
-node_modules/
-venv/
-.venv/
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
-.venv/
-venv/
-ENV/
-
-# Compiled source
-*.com
-*.class
-*.dll
-*.exe
-*.o
-*.so
-*.obj
-*.out
-
-# Logs
-*.log
-*.tmp
-
-# Environment specific
-.env
-.env.local
-*.env.*
-
-# OS generated
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
 .DS_Store
-Thumbs.db
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Environment & secrets
+.env
+*.jks
+*.keystore
+debug.keystore.base64
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# Compressed
-*.zip
-*.gz
-*.tar
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
-```
+# OS
+Thumbs.db
